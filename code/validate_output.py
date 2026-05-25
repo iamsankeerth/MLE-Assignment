@@ -30,11 +30,11 @@ def validate():
     input_path = os.path.join(os.path.dirname(__file__), "..", "support_tickets", "support_tickets.csv")
     
     if not os.path.exists(output_path):
-        print("❌ FAIL: output.csv not found at", output_path)
+        print("[FAIL] output.csv not found at", output_path)
         return False
     
     if not os.path.exists(input_path):
-        print("❌ FAIL: support_tickets.csv not found at", input_path)
+        print("[FAIL] support_tickets.csv not found at", input_path)
         return False
     
     # Count input rows
@@ -148,18 +148,18 @@ def validate():
             print(f"   ... and {len(errors) - 20} more errors")
     
     if warnings:
-        print(f"\n⚠️  WARNINGS ({len(warnings)}):")
+        print(f"\n[WARNINGS] ({len(warnings)}):")
         for w in warnings[:10]:  # cap at 10
-            print(f"   • {w}")
+            print(f"   - {w}")
         if len(warnings) > 10:
             print(f"   ... and {len(warnings) - 10} more warnings")
     
     if not errors:
-        print("\n✅ PASS: Output format is valid.")
+        print("\n[PASS] Output format is valid.")
         print("   Note: This validates structure only, NOT correctness.")
         print("   Your submission will also be evaluated on a hidden test set.")
     else:
-        print(f"\n❌ FAIL: {len(errors)} errors found. Fix them before submitting.")
+        print(f"\n[FAIL] {len(errors)} errors found. Fix them before submitting.")
     
     print("=" * 60)
     return len(errors) == 0
