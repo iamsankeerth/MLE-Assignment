@@ -1,14 +1,15 @@
 import os
 import json
 import traceback
-from typing import List, Dict, Any, Tuple
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Tuple, Optional
 from pydantic import BaseModel, Field
 from typing_extensions import Literal
 import litellm
 from litellm import completion
 
 from safety import SafetyInspector
-from retriever import SupportRetriever
+from retriever import IRetriever, SupportRetriever
 
 # Load environment variables if dot-env is available
 try:
@@ -55,10 +56,69 @@ class TicketPrediction(BaseModel):
         description="List of tool calls to perform. Must be empty [] if no action is warranted or if prerequisite identity check is needed first."
     )
 
+class ILLMEngine(ABC):
+    """
+    Abstract Port for Large Language Model completion.
+    Abstracts API call execution from orchestrator logic.
+    """
+    @abstractmethod
+    def completion(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        response_format: Any,
+        temperature: float = 0.0
+    ) -> Any:
+        pass
+
+class LiteLLMEngine(ILLMEngine):
+    """
+    Production Adapter performing actual LiteLLM API completions with rate limit retries.
+    """
+    def completion(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        response_format: Any,
+        temperature: float = 0.0
+    ) -> Any:
+        import time
+        max_retries = 5
+        backoff_factor = 2
+        
+        for attempt in range(max_retries):
+            try:
+                response = completion(
+                    model=model,
+                    messages=messages,
+                    response_format=response_format,
+                    temperature=temperature
+                )
+                return response
+            except Exception as e:
+                err_msg = str(e).lower()
+                is_rate_limit = "429" in err_msg or "rate" in err_msg or "quota" in err_msg or "exhausted" in err_msg
+                if is_rate_limit and attempt < max_retries - 1:
+                    sleep_time = (backoff_factor ** attempt) * 3
+                    print(f"[RATE_LIMIT] 429 detected, retrying in {sleep_time}s... (Attempt {attempt+1}/{max_retries})")
+                    time.sleep(sleep_time)
+                else:
+                    raise e
+
 class SupportAgentOrchestrator:
-    def __init__(self):
-        self.retriever = SupportRetriever()
-        self.safety_inspector = SafetyInspector()
+    """
+    Core orchestrator processing tickets across retrieval, safety, and reasoning.
+    Accepts pluggable components via Dependency Injection to support mock fakes.
+    """
+    def __init__(
+        self,
+        retriever: Optional[IRetriever] = None,
+        safety_inspector: Optional[SafetyInspector] = None,
+        llm_engine: Optional[ILLMEngine] = None
+    ):
+        self.retriever = retriever if retriever is not None else SupportRetriever()
+        self.safety_inspector = safety_inspector if safety_inspector is not None else SafetyInspector()
+        self.llm_engine = llm_engine if llm_engine is not None else LiteLLMEngine()
         
         # Load API specs for tools
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -139,7 +199,7 @@ class SupportAgentOrchestrator:
         for idx, doc in enumerate(retrieved_docs):
             docs_context += f"--- DOCUMENT {idx+1} ({doc['path']}) ---\n{doc['content']}\n\n"
 
-        # Step 3: Call LLM with Pydantic Structured Output
+        # Step 3: Call LLM with pluggable ILLMEngine
         try:
             model = self._determine_model()
             
@@ -171,30 +231,13 @@ Your objective is to classify and safely answer the user support ticket using ON
                     "content": rm["content"]
                 })
                 
-            # Perform completion with structured outputs via LiteLLM with rate limit retries
-            import time
-            max_retries = 5
-            backoff_factor = 2
-            response = None
-            
-            for attempt in range(max_retries):
-                try:
-                    response = completion(
-                        model=model,
-                        messages=llm_messages,
-                        response_format=TicketPrediction,
-                        temperature=0.0
-                    )
-                    break
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    is_rate_limit = "429" in err_msg or "rate" in err_msg or "quota" in err_msg or "exhausted" in err_msg
-                    if is_rate_limit and attempt < max_retries - 1:
-                        sleep_time = (backoff_factor ** attempt) * 3
-                        print(f"[RATE_LIMIT] 429 detected, retrying in {sleep_time}s... (Attempt {attempt+1}/{max_retries})")
-                        time.sleep(sleep_time)
-                    else:
-                        raise e
+            # Execute LLM completion call via pluggable seam
+            response = self.llm_engine.completion(
+                model=model,
+                messages=llm_messages,
+                response_format=TicketPrediction,
+                temperature=0.0
+            )
             
             content = response.choices[0].message.content
             parsed_data = TicketPrediction.model_validate_json(content)
@@ -213,9 +256,8 @@ Your objective is to classify and safely answer the user support ticket using ON
             actions_taken_str = json.dumps(action_inspection.actions_taken)
             final_status = "escalated" if action_inspection.suggested_action == "escalate" or parsed_data.status == "escalated" else "replied"
             
-            # If identity check remediation is required, promote status to escalated or stay replied as needed
             if action_inspection.suggested_action == "verify_identity":
-                final_status = "replied"  # Sending OTP challenge to user is part of active reply
+                final_status = "replied"
                 
             return {
                 "issue": issue_json,

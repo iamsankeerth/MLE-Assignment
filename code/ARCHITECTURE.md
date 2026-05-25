@@ -38,6 +38,12 @@ graph TD
    - Sanitizes actions (e.g., automatically escalates refunds exceeding the $500 threshold).
    - Ensures that sensitive operations (e.g., account locking or plan changes) have identity verification (`verify_identity`) as a prerequisite tool call if not already verified.
 
+5. **Decoupled Seams for Testability (Ports and Adapters)**:
+   - To support high-speed offline testing and decouple side-effects, the codebase utilizes a **Hexagonal Architecture** pattern:
+     - **`DocumentProvider` (Port in `retriever.py`)**: Abstracts filesystem operations. Decouples corpus data loading, enabling the `InMemoryDocumentProvider` adapter to feed test documents without reading actual files, while the production `FileSystemDocumentProvider` walks the `/data` directory.
+     - **`IRetriever` (Port in `retriever.py`)**: Decouples the document search implementation from the main orchestrator, making it trivial to swap or mock.
+     - **`ILLMEngine` (Port in `agent.py`)**: Decouples API invocations. The production `LiteLLMEngine` executes external requests with retry backoffs, while `FakeLLMEngine` instantly matches mock responses for offline unit tests.
+
 ---
 
 ## Retrieval Strategy
