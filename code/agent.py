@@ -22,6 +22,16 @@ REFUND_TERMS = ("refund", "chargeback", "money back", "give me my money", "payme
 SUBSCRIPTION_TERMS = ("cancel subscription", "pause subscription", "downgrade", "upgrade plan", "change plan", "modify subscription")
 ACCOUNT_ACTION_TERMS = ("delete my account", "merge account", "restore access", "change email", "reset password", "lock account")
 OUT_OF_SCOPE_TERMS = ("weather", "recipe", "homework", "movie recommendation", "sports score", "medical advice")
+FAQ_STYLE_TERMS = (
+    "how", "what", "when", "where", "why", "can", "could", "does", "do",
+    "help", "not working", "unable", "issue", "problem", "stopped", "error",
+    "compatible check", "practice", "score dispute", "certificate", "resume",
+)
+MANUAL_ACTION_TERMS = (
+    "increase my score", "move me to the next round", "ban the seller", "restore my access",
+    "review my answers", "make visa refund me", "tell the company", "change my name",
+)
+DETERMINISTIC_REPLY_SCORE_THRESHOLD = 0.12
 
 # Load environment variables if dot-env is available
 try:
@@ -171,6 +181,7 @@ class SupportAgentOrchestrator:
                     "summary": justification,
                 }
             }]
+        normalized_source_documents = self._normalize_source_documents_value(source_documents)
         return self._sanitize_output_row({
             "issue": issue_json,
             "subject": subject,
@@ -181,11 +192,11 @@ class SupportAgentOrchestrator:
             "justification": justification,
             "request_type": request_type,
             "confidence_score": confidence_score,
-            "source_documents": source_documents,
+            "source_documents": normalized_source_documents,
             "risk_level": risk_level,
             "pii_detected": pii_detected,
             "language": "en",
-            "actions_taken": json.dumps(actions_taken)
+            "actions_taken": self._serialize_actions(actions_taken)
         })
 
     def _sanitize_output_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -224,6 +235,7 @@ class SupportAgentOrchestrator:
     ) -> Dict[str, Any]:
         if actions_taken is None:
             actions_taken = []
+        normalized_source_documents = self._normalize_source_documents_value(source_documents)
         return self._sanitize_output_row({
             "issue": issue_json,
             "subject": subject,
@@ -234,12 +246,21 @@ class SupportAgentOrchestrator:
             "justification": justification,
             "request_type": request_type,
             "confidence_score": confidence_score,
-            "source_documents": source_documents,
+            "source_documents": normalized_source_documents,
             "risk_level": risk_level,
             "pii_detected": pii_detected,
             "language": "en",
-            "actions_taken": json.dumps(actions_taken)
+            "actions_taken": self._serialize_actions(actions_taken)
         })
+
+    def _serialize_actions(self, actions_taken: List[Dict[str, Any]]) -> str:
+        return json.dumps(actions_taken, sort_keys=True)
+
+    def _normalize_source_documents_value(self, source_documents: str) -> str:
+        if not source_documents:
+            return ""
+        paths = sorted({path for path in str(source_documents).split("|") if path})
+        return "|".join(paths)
 
     def _ticket_text(self, conversation: List[Dict[str, Any]], subject: str) -> str:
         if subject is None:
@@ -291,6 +312,85 @@ class SupportAgentOrchestrator:
         if not retrieved_docs:
             return False
         return max(float(doc.get("score", 0.0)) for doc in retrieved_docs) >= 0.01
+
+    def _normalize_language(self, language: str) -> str:
+        normalized = str(language or "").strip().lower()
+        return normalized if re.fullmatch(r"[a-z]{2}", normalized) else "en"
+
+    def _normalize_risk_level(self, inspected_risk: str, parsed_risk: str, final_status: str) -> str:
+        allowed = {"low", "medium", "high", "critical"}
+        risk_level = inspected_risk if inspected_risk != "low" else parsed_risk
+        if risk_level not in allowed:
+            risk_level = "medium"
+        if final_status == "escalated" and risk_level == "low":
+            risk_level = "medium"
+        return risk_level
+
+    def _normalize_request_type(self, request_type: str) -> str:
+        allowed = {"product_issue", "feature_request", "bug", "invalid"}
+        return request_type if request_type in allowed else "product_issue"
+
+    def _llm_confidence_band(self, final_status: str, risk_level: str, source_documents: str) -> float:
+        has_sources = bool(source_documents)
+        if final_status == "escalated":
+            if risk_level == "critical":
+                return 0.95
+            if risk_level == "high":
+                return 0.9
+            return 0.6 if not has_sources else 0.72
+        return 0.74 if has_sources else 0.58
+
+    def _is_manual_action_request(self, text: str) -> bool:
+        return any(term in text for term in MANUAL_ACTION_TERMS)
+
+    def _is_deterministic_reply_candidate(self, text: str, retrieved_docs: List[Dict[str, Any]]) -> bool:
+        if not retrieved_docs or not self._retrieval_is_strong(retrieved_docs):
+            return False
+        top_score = float(retrieved_docs[0].get("score", 0.0))
+        if top_score < DETERMINISTIC_REPLY_SCORE_THRESHOLD:
+            return False
+        if len(text.split()) > 90:
+            return False
+        if self._contains_routing_term(text, LEGAL_TERMS + COMPROMISE_TERMS + REFUND_TERMS + SUBSCRIPTION_TERMS + ACCOUNT_ACTION_TERMS):
+            return False
+        if self._is_manual_action_request(text):
+            return False
+        return any(term in text for term in FAQ_STYLE_TERMS) or "?" in text
+
+    def _summarize_document(self, content: str) -> str:
+        candidate_lines = []
+        for raw_line in str(content).splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("---"):
+                continue
+            line = re.sub(r"^[*-]\s+", "", line)
+            candidate_lines.append(line)
+            if len(candidate_lines) >= 3:
+                break
+        if not candidate_lines:
+            return "the support documentation provides relevant guidance."
+        text = re.sub(r"\s+", " ", " ".join(candidate_lines)).strip()
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        summary = " ".join(sentences[:2]).strip() or text
+        return summary[:320].rstrip()
+
+    def _infer_product_area(self, company: str, doc_path: str, text: str) -> str:
+        path = doc_path.lower()
+        text = text.lower()
+        if any(term in path or term in text for term in ("billing", "payment", "refund", "chargeback", "subscription")):
+            return "billing"
+        if any(term in path or term in text for term in ("account", "workspace", "seat", "login", "password")):
+            return "account-management"
+        if any(term in path or term in text for term in ("screen", "assessment", "test", "mock interview", "compatible check")):
+            return "screen"
+        if "visa" in path:
+            return "visa-core"
+        company_name = str(company or "").strip().lower()
+        return company_name if company_name and company_name != "nan" else "general"
+
+    def _build_deterministic_reply_response(self, top_doc: Dict[str, Any]) -> str:
+        summary = self._summarize_document(top_doc.get("content", ""))
+        return f"Based on {top_doc['path']}, {summary}"
 
     def _deterministic_routing_row(
         self,
@@ -370,6 +470,23 @@ class SupportAgentOrchestrator:
                 issue_json, subject, company,
                 "I can only help with DevPlatform, Claude, or Visa support topics using the provided support corpus.",
                 justification, "invalid", "low", pii_detected, product_area="out-of-scope", confidence_score=0.8
+            )
+
+        if self._is_deterministic_reply_candidate(text, retrieved_docs):
+            top_doc = retrieved_docs[0]
+            justification = policy_evidence("GOV-010", "replied", f"Strong corpus match allowed deterministic reply using {top_doc['path']}.")
+            return self._reply_row(
+                issue_json,
+                subject,
+                company,
+                self._build_deterministic_reply_response(top_doc),
+                justification,
+                "product_issue",
+                "low",
+                pii_detected,
+                source_documents,
+                product_area=self._infer_product_area(company, top_doc["path"], text),
+                confidence_score=0.82,
             )
 
         if not self._retrieval_is_strong(retrieved_docs):
@@ -486,8 +603,8 @@ class SupportAgentOrchestrator:
                 safe_retrieved_docs.append(doc)
         retrieved_docs = safe_retrieved_docs
         
-        source_docs_paths = [doc["path"] for doc in retrieved_docs]
-        source_documents_col = "|".join(source_docs_paths)
+        filtered_doc_paths = sorted(filtered_doc_paths)
+        source_documents_col = self._normalize_source_documents_value("|".join(doc["path"] for doc in retrieved_docs))
 
         deterministic_route = self._deterministic_routing_row(
             issue_json,
@@ -583,11 +700,15 @@ Your objective is to classify and safely answer the user support ticket using ON
                 proposed_actions
             )
             
-            actions_taken_str = json.dumps(action_inspection.actions_taken)
+            actions_taken_str = self._serialize_actions(action_inspection.actions_taken)
             final_status = "escalated" if action_inspection.suggested_action == "escalate" or parsed_data.status == "escalated" else "replied"
             
             if action_inspection.suggested_action == "verify_identity":
                 final_status = "replied"
+            normalized_risk_level = self._normalize_risk_level(action_inspection.risk_level, parsed_data.risk_level, final_status)
+            normalized_request_type = self._normalize_request_type(parsed_data.request_type)
+            normalized_confidence = self._llm_confidence_band(final_status, normalized_risk_level, source_documents_col)
+            normalized_language = self._normalize_language(parsed_data.language)
                 
             safety_justification = action_inspection.justification
             if filtered_doc_paths:
@@ -604,12 +725,12 @@ Your objective is to classify and safely answer the user support ticket using ON
                 "product_area": parsed_data.product_area,
                 "response": parsed_data.response,
                 "justification": f"{parsed_data.justification} [Safety: {safety_justification}]",
-                "request_type": parsed_data.request_type,
-                "confidence_score": float(parsed_data.confidence_score),
+                "request_type": normalized_request_type,
+                "confidence_score": normalized_confidence,
                 "source_documents": source_documents_col,
-                "risk_level": action_inspection.risk_level if action_inspection.risk_level != "low" else parsed_data.risk_level,
+                "risk_level": normalized_risk_level,
                 "pii_detected": pii_detected_str,
-                "language": parsed_data.language,
+                "language": normalized_language,
                 "actions_taken": actions_taken_str
             })
             

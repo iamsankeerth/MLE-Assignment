@@ -4,11 +4,11 @@ This document describes the high-level architecture, design decisions, safety la
 
 ## High-Level Architecture
 
-The triage agent is designed as a modular, fast, multi-stage pipeline that balances safety, processing speed, accuracy, and tool conformance. It handles inbound tickets in parallel, running pre-processing checks before sending clean inputs to the Large Language Model (LLM).
+The triage agent is designed as a modular, fast, multi-stage pipeline that balances safety, processing speed, accuracy, and tool conformance. The official submission path handles inbound tickets sequentially for reproducibility, while applying pre-processing checks before any bounded LLM fallback.
 
 ```mermaid
 graph TD
-    A[support_tickets.csv] --> B[Thread Pool Concurrent Executor]
+    A[support_tickets.csv] --> B[Sequential Submission Executor]
     B --> C[Stage 1: Safety & Pre-processing]
     C -->|PII Detected| C1[Mark pii_detected & Redact PII]
     C -->|Injection Detected| C2[Fail-fast Escalation]
@@ -29,10 +29,12 @@ graph TD
    - Compiles and indexes all 791 markdown files in the local support corpus under `data/` using `TfidfVectorizer` (scikit-learn).
    - Generates document embeddings based on word frequencies.
    - Queries documents via cosine similarity on the ticket's subject and body, applying directional boosting when a matching `company` subdirectory is specified.
+   - Breaks equal-score ties deterministically by sorting paths alphabetically after score ordering.
 
 3. **Orchestrator & LLM Integration (`agent.py`)**:
-   - Dynamically selects the active LLM backend from environment keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`) using `litellm`.
-   - Structures output predictions exactly conforming to the Pydantic schema (`TicketPrediction`), guaranteeing valid JSON properties (`status`, `product_area`, `confidence_score`, etc.) and structured API tool calls (`actions_taken`).
+   - Dynamically selects the active LLM backend from environment keys (`NVIDIA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`) using `litellm`.
+   - Uses deterministic routing as the default decision path. The LLM is invoked only when a ticket is safe, retrieval-backed, and not already covered by deterministic support logic.
+   - Structures output predictions exactly conforming to the Pydantic schema (`TicketPrediction`), then normalizes confidence, risk, language, and source ordering through deterministic post-processing before writing rows.
 
 4. **Post-Processing & Validation**:
    - Sanitizes actions (e.g., automatically escalates refunds exceeding the $500 threshold).
@@ -65,6 +67,7 @@ The separate pre-processing layer ensures **25% adversarial robustness score** p
 2. **PII Isolation**: By scrubbing PII from the conversation history, the LLM physically cannot echo credit cards or SSNs back to the user, fulfilling response safety rules.
 3. **RAG Spotlighting**: Retrieved documents are wrapped as untrusted evidence-only context, unsafe retrieved snippets are filtered, and the system prompt explicitly forbids following instructions embedded in user tickets or corpus documents.
 4. **Deterministic Multilingual Guardrails**: The runtime avoids heavyweight translation/classifier dependencies. Instead, it uses Unicode script checks, multilingual control-term dictionaries, mixed-script fail-closed logic, and homoglyph normalization.
+5. **Deterministic Submission Mode**: The official `main.py` path processes tickets sequentially in CSV order. Parallel execution remains an explicit debug override and is disabled by default.
 
 ### Governance Policy Matrix
 
@@ -97,6 +100,7 @@ The agent relies on deterministic thresholds and semantic signals to escalate ti
 - **Identity Theft / Fraud**: Suspected compromises trigger an immediate account lock and urgent escalation.
 - **Prerequisite Identity Verification**: If an action is requested but identity is unverified in context, the agent halts the action and calls `verify_identity`.
 - **Harmless Out-of-Scope**: Clearly harmless requests outside the support domain get a clarification reply instead of unnecessary escalation.
+- **Strong FAQ Matches**: Safe, short FAQ-style tickets with strong retrieval matches receive deterministic corpus-grounded replies without model generation.
 - **Retrieval Failures**: If retrieved context scores are too low, the agent escalates with lower confidence and a `GOV-012` justification.
 - **LLM/API Failures**: If the model provider fails but retrieval is strong and low-risk, the agent replies conservatively from the cited document; otherwise it escalates.
 
@@ -106,3 +110,4 @@ The agent relies on deterministic thresholds and semantic signals to escalate ti
 
 - **Highly Novel Synonyms**: Standard TF-IDF struggles if a user uses highly conversational slang without overlap in technical terms (e.g., "my invigilator is stuck" instead of "Zoom compatible check failed").
 - **Language Identification**: The agent parses ISO codes based on LLM output; extremely brief text ("help") might defaulted to English (`en`).
+- **Conservative Bias**: Deterministic routing intentionally prefers safe escalation or templated grounded replies over richer but more variable model wording on borderline tickets.

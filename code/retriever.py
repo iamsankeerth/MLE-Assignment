@@ -145,8 +145,8 @@ class SupportRetriever(IRetriever):
             
             results.append((idx, score))
             
-        # Re-sort
-        results = sorted(results, key=lambda x: x[1], reverse=True)
+        # Re-sort with a stable path tie-break to keep retrieval deterministic.
+        results = sorted(results, key=lambda x: (-x[1], self.paths[x[0]]))
         
         top_docs = []
         for idx, score in results[:top_k]:

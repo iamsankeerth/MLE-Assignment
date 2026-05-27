@@ -87,11 +87,13 @@ class TestDeepenedPipeline(unittest.TestCase):
         res = orchestrator.process_ticket(ticket_json, "Test active", "DevPlatform")
         
         self.assertEqual(res["status"], "replied")
-        self.assertEqual(res["product_area"], "tests")
+        self.assertEqual(res["product_area"], "screen")
         self.assertIn("data/devplatform/assessments/expiration.md", res["source_documents"])
         self.assertEqual(res["risk_level"], "low")
         self.assertEqual(res["actions_taken"], "[]")
-        self.assertIn("policy=none", res["justification"])
+        self.assertEqual(res["confidence_score"], 0.82)
+        self.assertIn("GOV-010", res["justification"])
+        self.assertTrue(res["response"].startswith("Based on data/devplatform/assessments/expiration.md"))
 
     def test_offline_orchestrator_action_gate_enforcement(self):
         # Propose refund and check unverified identity gate
@@ -149,8 +151,8 @@ class TestDeepenedPipeline(unittest.TestCase):
             llm_engine=FakeLLMEngine(json.dumps(mock_llm_response))
         )
 
-        ticket_json = '[{"role": "user", "content": "I need help with my account."}]'
-        res = orchestrator.process_ticket(ticket_json, "Account help", "DevPlatform")
+        ticket_json = '[{"role": "user", "content": "Account workspace memo reference for operations."}]'
+        res = orchestrator.process_ticket(ticket_json, "Account workspace memo", "DevPlatform")
 
         self.assertEqual(res["status"], "escalated")
         self.assertEqual(res["request_type"], "invalid")
@@ -176,8 +178,8 @@ class TestDeepenedPipeline(unittest.TestCase):
             llm_engine=FakeLLMEngine(json.dumps(mock_llm_response))
         )
 
-        ticket_json = '[{"role": "user", "content": "I need help with my account."}]'
-        res = orchestrator.process_ticket(ticket_json, "Account help", "DevPlatform")
+        ticket_json = '[{"role": "user", "content": "Account workspace memo reference for operations."}]'
+        res = orchestrator.process_ticket(ticket_json, "Account workspace memo", "DevPlatform")
 
         self.assertTrue(res["response"].startswith("'="))
         self.assertIn("GOV-008", res["justification"])
@@ -294,11 +296,12 @@ class TestDeepenedPipeline(unittest.TestCase):
             llm_engine=FailingLLMEngine()
         )
 
-        ticket_json = '[{"role": "user", "content": "How long do assessments stay active?"}]'
-        res = orchestrator.process_ticket(ticket_json, "Assessment expiration", "DevPlatform")
+        ticket_json = '[{"role": "user", "content": "Assessments expire after 30 days memo for recruiter reference."}]'
+        res = orchestrator.process_ticket(ticket_json, "Assessments expire memo", "DevPlatform")
 
         self.assertEqual(res["status"], "replied")
         self.assertIn("data/devplatform/assessments/expiration.md", res["source_documents"])
+        self.assertEqual(res["confidence_score"], 0.6)
         self.assertIn("GOV-011", res["justification"])
         self.assertNotIn("simulated provider outage", res["justification"])
 
@@ -340,6 +343,85 @@ class TestDeepenedPipeline(unittest.TestCase):
 
         self.assertEqual(res["status"], "replied")
         self.assertIn("policy=none", res["justification"])
+
+    def test_llm_confidence_is_normalized_for_replied_rows(self):
+        mock_docs = [{"path": "data/devplatform/general.md", "content": "General platform support guidance."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FakeLLMEngine(json.dumps({
+                "status": "replied",
+                "product_area": "general",
+                "response": "General support guidance applies here.",
+                "justification": "Used documentation.",
+                "request_type": "product_issue",
+                "confidence_score": 0.11,
+                "risk_level": "low",
+                "language": "EN",
+                "actions_taken": []
+            }))
+        )
+
+        ticket_json = '[{"role": "user", "content": "Platform memo for support reference."}]'
+        res = orchestrator.process_ticket(ticket_json, "Platform memo", "DevPlatform")
+
+        self.assertEqual(res["status"], "replied")
+        self.assertEqual(res["confidence_score"], 0.74)
+        self.assertEqual(res["language"], "en")
+
+    def test_repeatability_same_input_same_output(self):
+        mock_docs = [{"path": "data/devplatform/general.md", "content": "General platform support guidance."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        llm_response = json.dumps({
+            "status": "replied",
+            "product_area": "general",
+            "response": "General support guidance applies here.",
+            "justification": "Used documentation.",
+            "request_type": "product_issue",
+            "confidence_score": 0.33,
+            "risk_level": "low",
+            "language": "en",
+            "actions_taken": []
+        })
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FakeLLMEngine(llm_response)
+        )
+
+        ticket_json = '[{"role": "user", "content": "Platform memo for support reference."}]'
+        first = orchestrator.process_ticket(ticket_json, "Platform memo", "DevPlatform")
+        second = orchestrator.process_ticket(ticket_json, "Platform memo", "DevPlatform")
+
+        self.assertEqual(first, second)
+
+    def test_source_documents_are_sorted_stably(self):
+        mock_docs = [
+            {"path": "data/devplatform/z-last.md", "content": "platform memo guidance"},
+            {"path": "data/devplatform/a-first.md", "content": "platform memo guidance"},
+        ]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FakeLLMEngine(json.dumps({
+                "status": "replied",
+                "product_area": "general",
+                "response": "General support guidance applies here.",
+                "justification": "Used documentation.",
+                "request_type": "product_issue",
+                "confidence_score": 0.33,
+                "risk_level": "low",
+                "language": "en",
+                "actions_taken": []
+            }))
+        )
+
+        ticket_json = '[{"role": "user", "content": "Platform memo for support reference."}]'
+        res = orchestrator.process_ticket(ticket_json, "Platform memo", "DevPlatform")
+
+        self.assertEqual(
+            res["source_documents"],
+            "data/devplatform/a-first.md|data/devplatform/z-last.md"
+        )
 
 if __name__ == "__main__":
     unittest.main()

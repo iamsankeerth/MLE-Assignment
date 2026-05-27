@@ -13,6 +13,70 @@ EXPECTED_HEADERS = [
     "actions_taken"
 ]
 
+def _failure_row(row, justification: str):
+    return {
+        "issue": row["Issue"],
+        "subject": row["Subject"],
+        "company": row["Company"],
+        "status": "escalated",
+        "product_area": "general",
+        "response": "I apologize, but I am unable to complete your request safely. A support agent will follow up shortly.",
+        "justification": justification,
+        "request_type": "product_issue",
+        "confidence_score": 0.5,
+        "source_documents": "",
+        "risk_level": "medium",
+        "pii_detected": "false",
+        "language": "en",
+        "actions_taken": "[]"
+    }
+
+def process_ticket_rows(df_input, orchestrator, max_workers: int = 1, progress_every: int = 10):
+    num_tickets = len(df_input)
+    results = [None] * num_tickets
+    completed_count = 0
+
+    if max_workers <= 1:
+        print("[INFO] Processing tickets sequentially in deterministic submission mode...")
+        for idx, row in df_input.iterrows():
+            try:
+                results[idx] = orchestrator.process_ticket(
+                    row["Issue"],
+                    row["Subject"],
+                    row["Company"]
+                )
+            except Exception as e:
+                print(f"[ERROR] Exception processing row {idx}: {str(e)}")
+                results[idx] = _failure_row(row, "Technical processing failure in sequential submission mode.")
+            completed_count += 1
+            if completed_count % progress_every == 0 or completed_count == num_tickets:
+                print(f"[PROGRESS] Completed {completed_count}/{num_tickets} tickets")
+        return results
+
+    print(f"[INFO] Processing tickets concurrently using {max_workers} threads...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                orchestrator.process_ticket,
+                row["Issue"],
+                row["Subject"],
+                row["Company"]
+            ): idx
+            for idx, row in df_input.iterrows()
+        }
+
+        for future in as_completed(futures):
+            idx = futures[future]
+            completed_count += 1
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                print(f"[ERROR] Exception processing row {idx}: {str(e)}")
+                results[idx] = _failure_row(df_input.iloc[idx], "Technical processing failure in parallel debug mode.")
+            if completed_count % progress_every == 0 or completed_count == num_tickets:
+                print(f"[PROGRESS] Completed {completed_count}/{num_tickets} tickets")
+    return results
+
 def main():
     print("[START] Support Triage Agent Execution")
     start_time = time.time()
@@ -42,76 +106,14 @@ def main():
         print(f"[ERROR] Failed to initialize orchestrator: {str(e)}")
         return
 
-    # Process tickets concurrently in a thread pool
-    results = [None] * num_tickets
-    max_workers = 10  # Balance speed vs rate limits
-    
-    print(f"[INFO] Processing tickets concurrently using {max_workers} threads...")
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit tasks with their original row index
-        futures = {
-            executor.submit(
-                orchestrator.process_ticket,
-                row["Issue"],
-                row["Subject"],
-                row["Company"]
-            ): idx
-            for idx, row in df_input.iterrows()
-        }
-        
-        completed_count = 0
-        for future in as_completed(futures):
-            idx = futures[future]
-            completed_count += 1
-            try:
-                ticket_res = future.result()
-                results[idx] = ticket_res
-                # Print periodic progress
-                if completed_count % 10 == 0 or completed_count == num_tickets:
-                    elapsed = time.time() - start_time
-                    print(f"[PROGRESS] Completed {completed_count}/{num_tickets} tickets ({elapsed:.1f}s elapsed)")
-            except Exception as e:
-                print(f"[ERROR] Exception processing row {idx}: {str(e)}")
-                # Fail-safe backup row content to avoid empty predictions and program crashes
-                row = df_input.iloc[idx]
-                results[idx] = {
-                    "issue": row["Issue"],
-                    "subject": row["Subject"],
-                    "company": row["Company"],
-                    "status": "escalated",
-                    "product_area": "general",
-                    "response": "I apologize, but we are experiencing technical difficulties. An agent will follow up shortly.",
-                    "justification": f"Technical processing failure: {str(e)}",
-                    "request_type": "product_issue",
-                    "confidence_score": 0.5,
-                    "source_documents": "",
-                    "risk_level": "medium",
-                    "pii_detected": "false",
-                    "language": "en",
-                    "actions_taken": "[]"
-                }
+    max_workers = int(os.environ.get("SUPPORT_AGENT_MAX_WORKERS", "1"))
+    results = process_ticket_rows(df_input, orchestrator, max_workers=max_workers)
 
     # Ensure all slots are filled to prevent index errors
     for i in range(num_tickets):
         if results[i] is None:
             row = df_input.iloc[i]
-            results[i] = {
-                "issue": row["Issue"],
-                "subject": row["Subject"],
-                "company": row["Company"],
-                "status": "escalated",
-                "product_area": "general",
-                "response": "I apologize, but we are experiencing technical difficulties. An agent will follow up shortly.",
-                "justification": "Fallback due to incomplete slot processing.",
-                "request_type": "product_issue",
-                "confidence_score": 0.5,
-                "source_documents": "",
-                "risk_level": "medium",
-                "pii_detected": "false",
-                "language": "en",
-                "actions_taken": "[]"
-            }
+            results[i] = _failure_row(row, "Fallback due to incomplete slot processing.")
 
     # Create outputs dataframe
     df_output = pd.DataFrame(results)
