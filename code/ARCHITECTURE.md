@@ -23,7 +23,7 @@ graph TD
 
 1. **Safety & Pre-processing Layer (`safety.py`)**:
    - **PII Detection & Redaction**: Scans for Social Security Numbers (SSN), Credit Cards, emails, and phone numbers. If credit cards are found, they are validated via the **Luhn Algorithm** to minimize false positives. All detected PII is marked (`pii_detected=true`) and redacted using unique tokens (e.g. `[CARD_REDACTED_XXXX]`) before LLM ingestion.
-   - **Prompt Injection Defense**: Filters adversarial keywords and instruction-override heuristics, triggering a fail-fast escalation path without invoking the LLM, reducing latency and exposure.
+   - **Prompt Injection Defense**: Normalizes and scans user input before LLM invocation, including URL-decoded, Base64-decoded, ROT13-decoded, Unicode-normalized, zero-width-stripped, homoglyph-normalized, whitespace/punctuation-smuggled, multilingual, mixed-script, social-engineering, data-exfiltration, and classification-manipulation variants. Critical detections trigger fail-fast escalation without invoking the LLM.
 
 2. **TF-IDF Indexer & Retriever (`retriever.py`)**:
    - Compiles and indexes all 791 markdown files in the local support corpus under `data/` using `TfidfVectorizer` (scikit-learn).
@@ -37,6 +37,9 @@ graph TD
 4. **Post-Processing & Validation**:
    - Sanitizes actions (e.g., automatically escalates refunds exceeding the $500 threshold).
    - Ensures that sensitive operations (e.g., account locking or plan changes) have identity verification (`verify_identity`) as a prerequisite tool call if not already verified.
+   - Repairs malformed or unknown model-proposed tool calls into schema-valid human escalations, so `actions_taken` remains a valid JSON array conforming to `data/api_specs/internal_tools.json`.
+   - Overrides generated responses that appear to leak internal instructions, raw corpus, or output-manipulation content.
+   - Neutralizes CSV formula payloads in string output fields before writing rows.
 
 5. **Decoupled Seams for Testability (Ports and Adapters)**:
    - To support high-speed offline testing and decouple side-effects, the codebase utilizes a **Hexagonal Architecture** pattern:
@@ -58,8 +61,31 @@ With 791 separate files in the local corpus, dumping the entire database into th
 ## Safety / Adversarial Handling
 
 The separate pre-processing layer ensures **25% adversarial robustness score** protection:
-1. **No LLM Leakage**: Prompt injections are stopped *before* they can reach the LLM, completely preventing compliance with system instruction overrides.
+1. **No LLM Leakage**: Prompt injections, prompt-exfiltration requests, and classification-manipulation attempts are stopped *before* they can reach the LLM, completely preventing compliance with system instruction overrides.
 2. **PII Isolation**: By scrubbing PII from the conversation history, the LLM physically cannot echo credit cards or SSNs back to the user, fulfilling response safety rules.
+3. **RAG Spotlighting**: Retrieved documents are wrapped as untrusted evidence-only context, unsafe retrieved snippets are filtered, and the system prompt explicitly forbids following instructions embedded in user tickets or corpus documents.
+4. **Deterministic Multilingual Guardrails**: The runtime avoids heavyweight translation/classifier dependencies. Instead, it uses Unicode script checks, multilingual control-term dictionaries, mixed-script fail-closed logic, and homoglyph normalization.
+
+### Governance Policy Matrix
+
+The implementation borrows the core Agent Governance Toolkit idea: safety is enforced by deterministic application code, not by prompt wording alone. Policy decisions are recorded in the existing `justification` column as `Safety Decision` evidence.
+
+| Policy | Trigger | Deterministic action |
+| --- | --- | --- |
+| `GOV-001` | Prompt injection, multilingual meta-control, exfiltration, or output manipulation | Skip LLM and escalate to security |
+| `GOV-002` | PII detected | Redact before model processing |
+| `GOV-003` | Destructive action without verified identity | Replace action with `verify_identity` |
+| `GOV-004` | Refund request over `$500` | Escalate to billing |
+| `GOV-005` | Unknown or malformed tool call | Convert to schema-valid human escalation |
+| `GOV-006` | Unsafe retrieved document | Filter from RAG context |
+| `GOV-007` | Unsafe model output | Override with deterministic escalation |
+| `GOV-008` | CSV formula payload | Neutralize dangerous leading characters |
+| `GOV-009` | Allowed tool call | Confirm least-privilege tool schema and prerequisites |
+| `GOV-010` | Legal, security, account-compromise, or harmless out-of-scope routing signal | Deterministically route without relying on the LLM |
+| `GOV-011` | LLM/API unavailable but retrieval evidence is strong and low-risk | Return a conservative grounded reply with cited source docs |
+| `GOV-012` | Ambiguous request or weak/no retrieval evidence | Escalate with an explicit insufficient-evidence justification |
+
+This repository does not import Microsoft AGT directly because the challenge is a terminal batch evaluator with a strict 3-minute runtime. The local policy matrix gives the same practical benefit for this assignment: fail-closed enforcement, least-privilege tool handling, and audit evidence without extra runtime dependencies.
 
 ---
 
@@ -67,9 +93,12 @@ The separate pre-processing layer ensures **25% adversarial robustness score** p
 
 The agent relies on deterministic thresholds and semantic signals to escalate tickets:
 - **Financial Thresholds**: All refund requests over $500 are automatically escalated to a billing supervisor.
+- **Legal / Regulatory Threats**: Lawsuits, attorneys, subpoenas, regulators, or court language route to `escalate_to_human` with the legal department.
 - **Identity Theft / Fraud**: Suspected compromises trigger an immediate account lock and urgent escalation.
 - **Prerequisite Identity Verification**: If an action is requested but identity is unverified in context, the agent halts the action and calls `verify_identity`.
-- **Retrieval Failures**: If retrieved context scores are too low, the agent escalates with lower confidence.
+- **Harmless Out-of-Scope**: Clearly harmless requests outside the support domain get a clarification reply instead of unnecessary escalation.
+- **Retrieval Failures**: If retrieved context scores are too low, the agent escalates with lower confidence and a `GOV-012` justification.
+- **LLM/API Failures**: If the model provider fails but retrieval is strong and low-risk, the agent replies conservatively from the cited document; otherwise it escalates.
 
 ---
 
