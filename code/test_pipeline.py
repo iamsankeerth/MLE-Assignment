@@ -423,5 +423,79 @@ class TestDeepenedPipeline(unittest.TestCase):
             "data/devplatform/a-first.md|data/devplatform/z-last.md"
         )
 
+    def test_legitimate_queries_bypass_identity_verification(self):
+        mock_docs = [
+            {"path": "data/screen/compatible.md", "content": "mock interviews are compatible with all modern browsers."},
+            {"path": "data/claude/quality.md", "content": "claude quality guidelines and model degradation policies."},
+            {"path": "data/devplatform/errors.md", "content": "api 500 errors can happen during assessments."},
+            {"path": "data/visa/core.md", "content": "visa card not working and visa卡无法使用 support details."},
+            {"path": "data/billing/benefits.md", "content": "subscription benefits overview."}
+        ]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        
+        mock_llm_response = {
+            "status": "replied",
+            "product_area": "screen",
+            "response": "Support advice for your mock interviews query.",
+            "justification": "Analyzed mock interview compatible check documentation.",
+            "request_type": "product_issue",
+            "confidence_score": 0.9,
+            "risk_level": "low",
+            "language": "en",
+            "actions_taken": []
+        }
+        
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FakeLLMEngine(json.dumps(mock_llm_response))
+        )
+        
+        cases = [
+            ("Why are my mock interviews not working", "Mock Interview issue"),
+            ("Claude quality degradation", "Claude quality"),
+            ("Getting API 500 errors on custom questions help page", "API 500 errors"),
+            ("Visa卡无法使用，请问如何解决？", "Visa card not working"),
+            ("Help me understand subscription benefits", "Help query")
+        ]
+        
+        for content, subject in cases:
+            with self.subTest(content=content):
+                ticket_json = json.dumps([{"role": "user", "content": content}])
+                res = orchestrator.process_ticket(ticket_json, subject, "DevPlatform")
+                
+                # Verify these normal/advisory queries DO NOT trigger verify_identity!
+                actions = json.loads(res["actions_taken"])
+                self.assertEqual(len(actions), 0)
+                self.assertEqual(res["status"], "replied")
+
+    def test_mutating_actions_still_require_identity_verification(self):
+        mock_docs = [{"path": "data/billing/refund.md", "content": "Refunds can be issued."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FakeLLMEngine(json.dumps({
+                "status": "replied",
+                "product_area": "billing",
+                "response": "Processing refund.",
+                "justification": "Refund policy applied.",
+                "request_type": "product_issue",
+                "confidence_score": 0.9,
+                "risk_level": "medium",
+                "language": "en",
+                "actions_taken": [{"action": "issue_refund", "parameters": {"amount": 50.0, "transaction_id": "txn_1"}}]
+            }))
+        )
+        
+        # Unverified user refund request MUST trigger identity check
+        ticket_json = '[{"role": "user", "content": "Please refund my transaction txn_1. My email is customer@test.com"}]'
+        res = orchestrator.process_ticket(ticket_json, "Refund Request", "DevPlatform")
+        
+        self.assertEqual(res["status"], "replied")
+        actions = json.loads(res["actions_taken"])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action"], "verify_identity")
+        self.assertEqual(actions[0]["parameters"]["target"], "customer@test.com")
+
 if __name__ == "__main__":
     unittest.main()

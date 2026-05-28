@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+from datetime import datetime
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent import SupportAgentOrchestrator
@@ -12,6 +13,49 @@ EXPECTED_HEADERS = [
     "source_documents", "risk_level", "pii_detected", "language",
     "actions_taken"
 ]
+
+RUN_HISTORY_HEADERS = [
+    "started_at",
+    "finished_at",
+    "elapsed_seconds",
+    "elapsed_hms",
+    "num_tickets",
+    "max_workers",
+    "output_path",
+]
+
+
+def _format_elapsed(total_seconds: float) -> str:
+    rounded_seconds = int(round(total_seconds))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _append_run_history(
+    history_path: str,
+    started_at: str,
+    finished_at: str,
+    elapsed_seconds: float,
+    num_tickets: int,
+    max_workers: int,
+    output_path: str,
+):
+    history_exists = os.path.exists(history_path)
+    with open(history_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RUN_HISTORY_HEADERS)
+        if not history_exists:
+            writer.writeheader()
+        writer.writerow({
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_seconds": f"{elapsed_seconds:.2f}",
+            "elapsed_hms": _format_elapsed(elapsed_seconds),
+            "num_tickets": num_tickets,
+            "max_workers": max_workers,
+            "output_path": output_path,
+        })
+
 
 def _failure_row(row, justification: str):
     return {
@@ -78,12 +122,15 @@ def process_ticket_rows(df_input, orchestrator, max_workers: int = 1, progress_e
     return results
 
 def main():
+    started_at = datetime.now().astimezone()
     print("[START] Support Triage Agent Execution")
+    print(f"[TIMER] Started at {started_at.isoformat()}")
     start_time = time.time()
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     input_path = os.path.join(current_dir, "..", "support_tickets", "support_tickets.csv")
     output_path = os.path.join(current_dir, "..", "support_tickets", "output.csv")
+    run_history_path = os.path.join(current_dir, "..", "support_tickets", "run_history.csv")
     
     if not os.path.exists(input_path):
         print(f"[ERROR] Input file not found: {input_path}")
@@ -128,7 +175,20 @@ def main():
     except Exception as e:
         print(f"[ERROR] Failed to write outputs CSV: {str(e)}")
         
+    finished_at = datetime.now().astimezone()
     total_time = time.time() - start_time
+    _append_run_history(
+        run_history_path,
+        started_at.isoformat(),
+        finished_at.isoformat(),
+        total_time,
+        num_tickets,
+        max_workers,
+        output_path,
+    )
+    print(f"[TIMER] Finished at {finished_at.isoformat()}")
+    print(f"[TIMER] Elapsed {total_time:.2f} seconds ({_format_elapsed(total_time)})")
+    print(f"[TIMER] Run history appended to: {run_history_path}")
     print(f"[FINISHED] Processed all tickets in {total_time:.2f} seconds.")
 
 if __name__ == "__main__":

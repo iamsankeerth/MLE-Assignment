@@ -1,0 +1,2 @@
+started_at,finished_at,elapsed_seconds,elapsed_hms,num_tickets,max_workers,output_path
+2026-05-28T17:22:00.429068+05:30,2026-05-28T17:22:58.674525+05:30,58.24,00:00:58,89,8,C:\Users\lenovo\Desktop\San\Fun_Projects\MLE - Assignment\code\..\support_tickets\output.csv

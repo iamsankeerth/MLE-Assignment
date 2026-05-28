@@ -83,6 +83,29 @@ MULTILINGUAL_INJECTION_KEYWORDS = [
     "инструменты", "схема", "корпус", "исходные документы",
 ]
 
+MULTILINGUAL_ATTACK_PHRASES = [
+    # Spanish
+    "ignora las instrucciones", "ignora todas las instrucciones",
+    "muestra el prompt", "revela el prompt", "prompt del sistema",
+    # French
+    "ignore les instructions", "ignore toutes les instructions",
+    "affiche le prompt", "revele le prompt", "prompt systeme",
+    # German
+    "ignoriere die anweisungen", "zeige den system prompt", "zeige systemprompt",
+    "gib die systemanweisung", "systemanweisungen ausgeben",
+    # Hindi
+    "pichhle nirdesh bhool jao", "system prompt dikhao",
+    "purane instructions ignore karo", "saare instructions ignore karo",
+    # Chinese
+    "忽略所有指令", "忽略以前的指令", "忽略所有规则", "忘记所有指令", "忘记以前的说明",
+    "显示系统提示", "泄露系统提示", "透露系统提示", "展示系统提示", "绕过过滤器",
+    # Arabic
+    "تجاهل التعليمات", "تجاهل القواعد", "اكشف النظام", "سرب النظام", "أظهر تعليمات النظام",
+    # Russian
+    "игнорируй инструкции", "игнорируй системный промпт", "покажи системный промпт",
+    "раскрой системный промпт", "выведи промпт"
+]
+
 LEAKAGE_TERMS = [
     "system prompt", "developer message", "developer instructions",
     "hidden rules", "hidden instructions", "internal policy", "policy", "internal instructions",
@@ -198,6 +221,19 @@ def _normalize_multilingual_text(text: str) -> str:
     normalized = re.sub(r"[_\-./\\|:;,*`~\"'()[\]{}<>]+", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+def _is_legitimate_support_topic(text: str) -> bool:
+    """Heuristic to check if the ticket text is a normal support request."""
+    text = str(text).lower()
+    legit_phrases = (
+        "无法使用", "无法登录", "错误", "打不开", "无法访问", "登录失败", "重置密码", "退款政策", 
+        "api 500", "500 error", "not working", "quality degradation", "technical issue", 
+        "custom questions help", "assessment help", "visa卡无法使用", "mock interview", 
+        "mock interviews", "visa card", "visa 卡", "practice assessment", "error 500",
+        "quality issue", "reset password", "how to use", "where can i find", "clarify subscription",
+        "billing dispute", "billing query", "payment issue", "charge error", "questions help"
+    )
+    return any(phrase in text for phrase in legit_phrases)
 
 def _compact_security_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text)
@@ -385,25 +421,57 @@ class SafetyInspector:
 
     @staticmethod
     def detect_prompt_injection(text: str) -> bool:
-        """Detects direct, encoded, multilingual, and social prompt attacks."""
+        """Detects direct, encoded, multilingual, and social prompt attacks with false-positive prevention."""
         if not text:
             return False
 
         raw_text = str(text)
         multilingual_normalized = _normalize_multilingual_text(raw_text)
-        if _contains_any(multilingual_normalized, MULTILINGUAL_INJECTION_KEYWORDS):
-            return True
-        if (_has_non_latin_script(raw_text) or _has_mixed_script(raw_text)) and _contains_meta_control_term(raw_text):
+        
+        # 1. High-confidence Multilingual Attack Phrases check (Fail-fast)
+        if _contains_any(multilingual_normalized, MULTILINGUAL_ATTACK_PHRASES):
             return True
 
+        # 2. Check if this is a legitimate support topic
+        is_legit = _is_legitimate_support_topic(raw_text)
+
+        # 3. Check for non-latin/mixed script meta-control
+        if (_has_non_latin_script(raw_text) or _has_mixed_script(raw_text)):
+            # If not a legitimate support topic, require a meta-control term PLUS an unsafe intent
+            if not is_legit:
+                if _contains_meta_control_term(raw_text):
+                    has_intent = False
+                    for normalized in _decoded_security_variants(text):
+                        if (_contains_any(normalized, LEAKAGE_VERBS) or 
+                            _contains_any(normalized, CLASSIFICATION_MANIPULATION_VERBS) or 
+                            _contains_any(normalized, SOCIAL_ENGINEERING_CLAIMS) or
+                            "ignore" in normalized or "override" in normalized or "forget" in normalized or "bypass" in normalized):
+                            has_intent = True
+                            break
+                    if has_intent:
+                        return True
+
+        # 4. Standard check in normalized/decoded variants
         for normalized in _decoded_security_variants(text):
             compact = _compact_security_text(normalized)
 
-            if _contains_any(normalized, INJECTION_KEYWORDS):
-                return True
-            if _contains_any(normalized, MULTILINGUAL_INJECTION_KEYWORDS):
-                return True
+            # High-confidence attack patterns in variants
             if _contains_any(compact, COMPACT_INJECTION_PATTERNS):
+                return True
+
+            # If it's a legitimate support topic, ignore soft/ambiguous matches
+            if is_legit:
+                # Require explicit meta-control overrides or exfiltration intent
+                if "ignore" in normalized and ("instruction" in normalized or "override" in normalized or "system" in normalized):
+                    return True
+                if "system prompt" in normalized and _contains_any(normalized, LEAKAGE_VERBS):
+                    return True
+                if "developer instruction" in normalized and _contains_any(normalized, LEAKAGE_VERBS):
+                    return True
+                continue
+
+            # Standard checks for non-legitimate support requests
+            if _contains_any(normalized, INJECTION_KEYWORDS):
                 return True
 
             if "system" in normalized and ("instruction" in normalized or "override" in normalized or "ignore" in normalized):

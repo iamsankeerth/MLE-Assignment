@@ -195,5 +195,17 @@ class TestSafetyInspector(unittest.TestCase):
         self.assertIn("GOV-005", res.justification)
         self.assertIn("Unknown tool action", res.actions_taken[0]["parameters"]["summary"])
 
+    def test_legitimate_multilingual_and_technical_support_not_flagged(self):
+        cases = [
+            "Visa卡无法使用，请问如何解决？",
+            "I am getting API 500 errors on my workspace dashboard.",
+            "Can you help with Custom Questions? I need assistance configuring my assessment.",
+            "How do I setup a custom question for Claude developer role?",
+            "我的系统登录出错了，报错码为500，请帮忙解决。",
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertFalse(self.inspector.detect_prompt_injection(case))
+
 if __name__ == "__main__":
     unittest.main()
