@@ -18,10 +18,20 @@ AMOUNT_PATTERN = re.compile(r'(?:\$|usd\s*)\s*(\d+(?:\.\d{1,2})?)|\b(\d+(?:\.\d{
 
 LEGAL_TERMS = ("legal", "lawyer", "attorney", "sue", "lawsuit", "court", "regulator", "regulatory", "subpoena")
 COMPROMISE_TERMS = ("identity theft", "account takeover", "unauthorized login", "unauthorised login", "hacked", "compromised", "stolen", "fraudulent", "unknown ip", "do not recognize")
-REFUND_TERMS = ("refund", "chargeback", "money back", "give me my money", "payment dispute")
-SUBSCRIPTION_TERMS = ("cancel subscription", "pause subscription", "downgrade", "upgrade plan", "change plan", "modify subscription")
+REFUND_TERMS = ("refund", "refund request", "chargeback", "money back", "give me my money", "payment dispute")
+SUBSCRIPTION_TERMS = ("cancel subscription", "pause subscription", "downgrade", "upgrade plan", "change plan", "modify subscription", "change subscription", "subscription change")
 ACCOUNT_ACTION_TERMS = ("delete my account", "merge account", "restore access", "change email", "reset password", "lock account")
 OUT_OF_SCOPE_TERMS = ("weather", "recipe", "homework", "movie recommendation", "sports score", "medical advice")
+UNSUPPORTED_ACTION_TERMS = (
+    "file deletion code", "delete files", "delete unnecessary files", "remove files",
+    "rm -rf", "format disk", "delete system files", "remove employee",
+    "remove employees", "remove an employee", "hiring account", "hiring accounts",
+)
+BILLING_DISPUTE_ESCALATION_TERMS = (
+    "unresolved", "not resolved", "still unresolved", "still waiting", "no response",
+    "charged twice", "double charged", "overcharged", "billing dispute", "payment dispute",
+    "chargeback dispute", "months", "regulator", "complaint",
+)
 FAQ_STYLE_TERMS = (
     "how", "what", "when", "where", "why", "can", "could", "does", "do",
     "help", "not working", "unable", "issue", "problem", "stopped", "error",
@@ -425,7 +435,10 @@ class SupportAgentOrchestrator:
         advisory_indicators = (
             "why", "how to", "troubleshoot", "not working", "unable to connect", "error 500", 
             "500 error", "pricing confusion", "quality issue", "degradation", "failed assessment",
-            "mock interviews not working", "help with", "policy clarification", "information about"
+            "mock interviews not working", "help with", "policy clarification", "information about",
+            "should i", "would you recommend", "what is better", "vs", "difference between",
+            "advice", "question about", "inquiry", "clarification", "what are the options",
+            "information", "can you explain", "what is the process", "how does"
         )
         
         # Explicit mutating action phrases
@@ -447,12 +460,66 @@ class SupportAgentOrchestrator:
         has_target = any(target in text for target in account_targets)
         
         if has_verb and has_target:
-            # If it has advisory terms, make sure it is not just general troubleshooting
             if any(indicator in text for indicator in advisory_indicators):
-                return any(term in text for term in ("please", "need", "want", "dispute", "refund", "cancel", "delete", "reset"))
+                return False
             return True
             
         return False
+
+    def _is_unsupported_action_request(self, text: str) -> bool:
+        """Flags requests outside the supported ticket domain that should be answered, not escalated."""
+        text = str(text or "").lower()
+        if any(term in text for term in UNSUPPORTED_ACTION_TERMS):
+            return True
+        if "employee" in text and any(term in text for term in ("remove", "delete", "terminate")) and "hiring" in text:
+            return True
+        if any(term in text for term in ("script", "code", "command")) and any(term in text for term in ("delete file", "delete files", "remove files", "wipe", "format disk")):
+            return True
+        return False
+
+    def _is_unresolved_billing_dispute(self, text: str) -> bool:
+        """Escalates only billing cases that are already disputed, unresolved, or high-risk."""
+        text = str(text or "").lower()
+        billing_context = self._contains_routing_term(text, REFUND_TERMS) or any(
+            term in text for term in ("billing", "payment", "charge", "invoice", "card")
+        )
+        if not billing_context:
+            return False
+        return any(term in text for term in BILLING_DISPUTE_ESCALATION_TERMS)
+
+    def _refund_detail_guidance(self, text: str) -> str:
+        missing = []
+        lowered = str(text or "").lower()
+        if self._extract_amount(lowered) is None:
+            missing.append("refund amount")
+        if not any(term in lowered for term in ("transaction", "txn", "order", "invoice", "receipt", "charge id", "payment id")):
+            missing.append("transaction/order ID")
+        if not any(term in lowered for term in ("because", "reason", "duplicate", "accidental", "wrong", "cancelled", "charged")):
+            missing.append("refund reason")
+        if not missing:
+            missing.append("any remaining context needed to validate the request")
+        return (
+            " Please also provide the "
+            + ", ".join(missing)
+            + " so we can review the refund request safely."
+        )
+
+    def _subscription_detail_guidance(self, text: str) -> str:
+        missing = []
+        lowered = str(text or "").lower()
+        if not any(term in lowered for term in ("basic", "pro", "team", "enterprise", "current plan", "plan")):
+            missing.append("current plan or subscription")
+        if not any(term in lowered for term in ("upgrade", "downgrade", "cancel", "pause", "change to", "switch to", "modify")):
+            missing.append("requested subscription change")
+        if not any(term in lowered for term in ("today", "immediately", "next billing", "end of month", "effective", "date")):
+            missing.append("preferred effective date")
+        if not missing:
+            missing.append("any remaining account details needed to validate the request")
+        return (
+            " Please also provide the "
+            + ", ".join(missing)
+            + " so we can proceed with the subscription request safely."
+        )
 
     def _is_deterministic_reply_candidate(self, text: str, retrieved_docs: List[Dict[str, Any]]) -> bool:
         if not retrieved_docs or not self._retrieval_is_strong(retrieved_docs):
@@ -554,6 +621,19 @@ class SupportAgentOrchestrator:
             + "\n[TRUNCATED: document content shortened before LLM context injection]"
         )
 
+    def _build_identity_gate_response(
+        self,
+        retrieved_docs: List[Dict[str, Any]],
+        text: str,
+        identity_message: str,
+    ) -> Tuple[str, str]:
+        if not retrieved_docs:
+            return identity_message, ""
+        supporting_docs = self._select_supporting_docs(retrieved_docs, text)
+        grounded_context = self._build_grounded_reply_response(supporting_docs)
+        source_documents = self._normalize_source_documents_value("|".join(doc["path"] for doc in supporting_docs))
+        return f"{grounded_context} {identity_message}", source_documents
+
     def _deterministic_routing_row(
         self,
         issue_json: str,
@@ -567,6 +647,14 @@ class SupportAgentOrchestrator:
         text = self._ticket_text(conversation, subject)
         identity_verified = self._identity_verified(text)
         amount = self._extract_amount(text)
+
+        if self._is_unsupported_action_request(text):
+            justification = policy_evidence("GOV-010", "replied", "Unsupported out-of-scope action answered with clarification instead of human escalation.")
+            return self._reply_row(
+                issue_json, subject, company,
+                "I cannot complete that request in this support flow because it is outside the supported DevPlatform, Claude, and Visa support corpus. I can help with documented support topics, but I cannot provide file-deletion code or make hiring-account employee changes here.",
+                justification, "invalid", "low", pii_detected, product_area="out-of-scope", confidence_score=0.84
+            )
 
         if self._contains_routing_term(text, LEGAL_TERMS):
             justification = policy_evidence("GOV-010", "escalated", "Legal/regulatory threat requires human review.")
@@ -595,6 +683,15 @@ class SupportAgentOrchestrator:
                 request_type="product_issue", product_area="account-security", actions_taken=actions, confidence_score=0.9
             )
 
+        if self._is_unresolved_billing_dispute(text):
+            justification = policy_evidence("GOV-004", "escalated", "Unresolved billing dispute requires human billing review.")
+            return self._safe_escalation_row(
+                issue_json, subject, company,
+                "I am escalating this because it appears to be an unresolved billing dispute that needs human review.",
+                justification, pii_detected, risk_level="high", department="billing", priority="high",
+                request_type="product_issue", product_area="billing", confidence_score=0.88
+            )
+
         if self._contains_routing_term(text, REFUND_TERMS):
             if amount is not None and amount > 500:
                 justification = policy_evidence("GOV-004", "escalated", f"Refund/dispute amount ${amount} exceeds the $500 authorization limit.")
@@ -607,10 +704,16 @@ class SupportAgentOrchestrator:
             if self._is_action_request(text) and not identity_verified:
                 target = self._extract_identifier(text)
                 justification = policy_evidence("GOV-003", "verify_identity", "Refund/payment action requires identity verification before any account-level action.")
+                response, identity_source_documents = self._build_identity_gate_response(
+                    retrieved_docs,
+                    text,
+                    "Before any refund or payment action can be considered, we need to verify your identity."
+                    + self._refund_detail_guidance(text)
+                )
                 return self._reply_row(
                     issue_json, subject, company,
-                    "Before any refund or payment action can be considered, we need to verify your identity.",
-                    justification, "product_issue", "medium", pii_detected, source_documents,
+                    response,
+                    justification, "product_issue", "medium", pii_detected, identity_source_documents or source_documents,
                     product_area="billing", confidence_score=0.85,
                     actions_taken=[{"action": "verify_identity", "parameters": {"method": "email_otp", "target": target}}]
                 )
@@ -618,10 +721,16 @@ class SupportAgentOrchestrator:
         if self._contains_routing_term(text, SUBSCRIPTION_TERMS + ACCOUNT_ACTION_TERMS) and self._is_action_request(text) and not identity_verified:
             target = self._extract_identifier(text)
             justification = policy_evidence("GOV-003", "verify_identity", "Account-level action requires identity verification before proceeding.")
+            response, identity_source_documents = self._build_identity_gate_response(
+                retrieved_docs,
+                text,
+                "I can help route this, but account-level changes require identity verification first."
+                + self._subscription_detail_guidance(text)
+            )
             return self._reply_row(
                 issue_json, subject, company,
-                "I can help route this, but account-level changes require identity verification first.",
-                justification, "product_issue", "medium", pii_detected, source_documents,
+                response,
+                justification, "product_issue", "medium", pii_detected, identity_source_documents or source_documents,
                 product_area="account-management", confidence_score=0.85,
                 actions_taken=[{"action": "verify_identity", "parameters": {"method": "email_otp", "target": target}}]
             )
@@ -653,12 +762,11 @@ class SupportAgentOrchestrator:
             )
 
         if not self._retrieval_is_strong(retrieved_docs):
-            justification = policy_evidence("GOV-012", "escalated", "Retrieved corpus evidence was insufficient for a grounded answer.")
-            return self._safe_escalation_row(
+            justification = policy_evidence("GOV-012", "replied", "Retrieved corpus evidence was insufficient, but the request did not match legal, security, or unresolved billing escalation criteria.")
+            return self._reply_row(
                 issue_json, subject, company,
-                "I do not have enough reliable support documentation to answer this safely, so I am escalating it for human review.",
-                justification, pii_detected, risk_level="medium", department="general", priority="normal",
-                request_type="product_issue", confidence_score=0.65
+                "I do not have enough reliable support documentation to answer that within the supported corpus. I can help with documented DevPlatform, Claude, or Visa support topics if you share a more specific product question.",
+                justification, "invalid", "low", pii_detected, product_area="out-of-scope", confidence_score=0.58
             )
 
         return None

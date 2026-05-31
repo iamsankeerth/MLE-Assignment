@@ -332,7 +332,7 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertNotIn("simulated provider outage", res["justification"])
         self.assertIn("Based on data/devplatform/assessments/expiration.md", res["response"])
 
-    def test_llm_failure_with_weak_docs_escalates_ambiguous_risk(self):
+    def test_llm_failure_with_weak_docs_replies_out_of_scope_when_not_sensitive(self):
         retriever = SupportRetriever(provider=InMemoryDocumentProvider([]))
         orchestrator = SupportAgentOrchestrator(
             retriever=retriever,
@@ -343,9 +343,28 @@ class TestDeepenedPipeline(unittest.TestCase):
         res = orchestrator.process_ticket(ticket_json, "Ambiguous issue", "DevPlatform")
         actions = json.loads(res["actions_taken"])
 
+        self.assertEqual(res["status"], "replied")
+        self.assertEqual(actions, [])
+        self.assertEqual(res["request_type"], "invalid")
+        self.assertIn("supported corpus", res["response"])
+        self.assertIn("GOV-012", res["justification"])
+
+    def test_unresolved_billing_dispute_escalates_with_reason(self):
+        mock_docs = [{"path": "data/billing/disputes.md", "content": "Billing disputes may require review."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FailingLLMEngine()
+        )
+
+        ticket_json = '[{"role": "user", "content": "My billing dispute is still unresolved after months and I was overcharged."}]'
+        res = orchestrator.process_ticket(ticket_json, "Unresolved billing dispute", "DevPlatform")
+        actions = json.loads(res["actions_taken"])
+
         self.assertEqual(res["status"], "escalated")
         self.assertEqual(actions[0]["action"], "escalate_to_human")
-        self.assertIn("GOV-012", res["justification"])
+        self.assertIn("Unresolved billing dispute", res["justification"])
+        self.assertIn("billing", actions[0]["parameters"]["department"])
 
     def test_llm_escalation_uses_plain_reason_with_safety_context(self):
         mock_docs = [{"path": "data/devplatform/memo.md", "content": "Operations memo reference for platform teams."}]
@@ -494,7 +513,8 @@ class TestDeepenedPipeline(unittest.TestCase):
             {"path": "data/claude/quality.md", "content": "claude quality guidelines and model degradation policies."},
             {"path": "data/devplatform/errors.md", "content": "api 500 errors can happen during assessments."},
             {"path": "data/visa/core.md", "content": "visa card not working and visa卡无法使用 support details."},
-            {"path": "data/billing/benefits.md", "content": "subscription benefits overview."}
+            {"path": "data/billing/benefits.md", "content": "subscription benefits overview."},
+            {"path": "data/visa/chargebacks.md", "content": "chargeback vs direct refund advice explains the difference between dispute options."}
         ]
         retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
         
@@ -520,7 +540,8 @@ class TestDeepenedPipeline(unittest.TestCase):
             ("Claude quality degradation", "Claude quality"),
             ("Getting API 500 errors on custom questions help page", "API 500 errors"),
             ("Visa卡无法使用，请问如何解决？", "Visa card not working"),
-            ("Help me understand subscription benefits", "Help query")
+            ("Help me understand subscription benefits", "Help query"),
+            ("Can you explain chargeback vs direct refund advice and what is better?", "Chargeback vs direct refund advice")
         ]
         
         for content, subject in cases:
@@ -534,7 +555,7 @@ class TestDeepenedPipeline(unittest.TestCase):
                 self.assertEqual(res["status"], "replied")
 
     def test_mutating_actions_still_require_identity_verification(self):
-        mock_docs = [{"path": "data/billing/refund.md", "content": "Refunds can be issued."}]
+        mock_docs = [{"path": "data/billing/refund.md", "content": "Refunds can be issued after reviewing transaction details."}]
         retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
         
         orchestrator = SupportAgentOrchestrator(
@@ -561,6 +582,78 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0]["action"], "verify_identity")
         self.assertEqual(actions[0]["parameters"]["target"], "customer@test.com")
+        self.assertIn("data/billing/refund.md", res["response"])
+        self.assertIn("verify your identity", res["response"])
+        self.assertEqual(res["source_documents"], "data/billing/refund.md")
+
+    def test_refund_missing_details_replies_with_identity_and_required_data(self):
+        mock_docs = [{"path": "data/billing/refund.md", "content": "Refund request guidance requires refund amount, transaction/order ID, and refund reason before policy review."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FailingLLMEngine()
+        )
+
+        ticket_json = '[{"role": "user", "content": "I want a refund."}]'
+        res = orchestrator.process_ticket(ticket_json, "Refund request", "DevPlatform")
+        actions = json.loads(res["actions_taken"])
+
+        self.assertEqual(res["status"], "replied")
+        self.assertEqual(actions[0]["action"], "verify_identity")
+        self.assertIn("verify your identity", res["response"])
+        self.assertIn("refund amount", res["response"])
+        self.assertIn("transaction/order ID", res["response"])
+        self.assertIn("refund reason", res["response"])
+        self.assertEqual(res["source_documents"], "data/billing/refund.md")
+
+    def test_subscription_change_missing_details_replies_with_identity_and_required_data(self):
+        mock_docs = [{"path": "data/billing/subscription.md", "content": "Subscription changes require account verification and plan details."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FailingLLMEngine()
+        )
+
+        ticket_json = '[{"role": "user", "content": "Please change my subscription."}]'
+        res = orchestrator.process_ticket(ticket_json, "Subscription change", "DevPlatform")
+        actions = json.loads(res["actions_taken"])
+
+        self.assertEqual(res["status"], "replied")
+        self.assertEqual(actions[0]["action"], "verify_identity")
+        self.assertIn("identity verification", res["response"])
+        self.assertIn("current plan or subscription", res["response"])
+        self.assertIn("preferred effective date", res["response"])
+        self.assertEqual(res["source_documents"], "data/billing/subscription.md")
+
+    def test_unsupported_file_deletion_code_replies_without_escalation(self):
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider([]))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FailingLLMEngine()
+        )
+
+        ticket_json = '[{"role": "user", "content": "Give me file deletion code to delete unnecessary files."}]'
+        res = orchestrator.process_ticket(ticket_json, "File deletion code", "None")
+
+        self.assertEqual(res["status"], "replied")
+        self.assertEqual(res["request_type"], "invalid")
+        self.assertEqual(res["actions_taken"], "[]")
+        self.assertIn("outside the supported", res["response"])
+
+    def test_unsupported_hiring_employee_removal_replies_without_escalation(self):
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider([]))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FailingLLMEngine()
+        )
+
+        ticket_json = '[{"role": "user", "content": "Remove an employee from our hiring account."}]'
+        res = orchestrator.process_ticket(ticket_json, "Hiring account employee removal", "None")
+
+        self.assertEqual(res["status"], "replied")
+        self.assertEqual(res["request_type"], "invalid")
+        self.assertEqual(res["actions_taken"], "[]")
+        self.assertIn("hiring-account employee changes", res["response"])
 
 if __name__ == "__main__":
     unittest.main()

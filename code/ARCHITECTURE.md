@@ -4,11 +4,11 @@ This document describes the high-level architecture, design decisions, safety la
 
 ## High-Level Architecture
 
-The triage agent is designed as a modular, fast, multi-stage pipeline that balances safety, processing speed, accuracy, and tool conformance. The official submission path handles inbound tickets sequentially for reproducibility, while applying pre-processing checks before any bounded LLM fallback.
+The triage agent is designed as a modular, fast, multi-stage pipeline that balances safety, processing speed, accuracy, and tool conformance. The official submission path applies pre-processing checks before any bounded LLM fallback and defaults to 4 worker threads to stay comfortably under the 3-minute batch limit. Strict sequential execution remains available by setting `SUPPORT_AGENT_MAX_WORKERS=1`.
 
 ```mermaid
 graph TD
-    A[support_tickets.csv] --> B[Sequential Submission Executor]
+    A[support_tickets.csv] --> B[Timed Batch Executor]
     B --> C[Stage 1: Safety & Pre-processing]
     C -->|PII Detected| C1[Mark pii_detected & Redact PII]
     C -->|Injection Detected| C2[Fail-fast Escalation]
@@ -26,7 +26,7 @@ graph TD
    - **Prompt Injection Defense**: Normalizes and scans user input before LLM invocation, including URL-decoded, Base64-decoded, ROT13-decoded, Unicode-normalized, zero-width-stripped, homoglyph-normalized, whitespace/punctuation-smuggled, multilingual, mixed-script, social-engineering, data-exfiltration, and classification-manipulation variants. Critical detections trigger fail-fast escalation without invoking the LLM.
 
 2. **TF-IDF Indexer & Retriever (`retriever.py`)**:
-   - Compiles and indexes all 791 markdown files in the local support corpus under `data/` using `TfidfVectorizer` (scikit-learn).
+   - Compiles and indexes the local support corpus under `data/` using `TfidfVectorizer` (scikit-learn). The latest local run indexed 790 corpus documents.
    - Generates document embeddings based on word frequencies.
    - Queries documents via cosine similarity on the ticket's subject and body, applying directional boosting when a matching `company` subdirectory is specified.
    - Breaks equal-score ties deterministically by sorting paths alphabetically after score ordering.
@@ -37,8 +37,9 @@ graph TD
    - Structures output predictions exactly conforming to the Pydantic schema (`TicketPrediction`), then normalizes confidence, risk, language, and source ordering through deterministic post-processing before writing rows.
 
 4. **Post-Processing & Validation**:
-   - Sanitizes actions (e.g., automatically escalates refunds exceeding the $500 threshold).
-   - Ensures that sensitive operations (e.g., account locking or plan changes) have identity verification (`verify_identity`) as a prerequisite tool call if not already verified.
+   - Sanitizes actions (e.g., automatically escalates refunds exceeding the $500 threshold or unresolved billing disputes).
+   - Ensures that sensitive operations (e.g., refunds, account locking, or plan changes) have identity verification (`verify_identity`) as a prerequisite tool call if not already verified.
+   - For refund or subscription-change requests that lack necessary details, replies with a `verify_identity` action and asks for the missing refund amount, transaction/order ID, reason, current plan, requested change, or effective date instead of escalating immediately.
    - Repairs malformed or unknown model-proposed tool calls into schema-valid human escalations, so `actions_taken` remains a valid JSON array conforming to `data/api_specs/internal_tools.json`.
    - Overrides generated responses that appear to leak internal instructions, raw corpus, or output-manipulation content.
    - Neutralizes CSV formula payloads in string output fields before writing rows.
@@ -53,9 +54,9 @@ graph TD
 
 ## Retrieval Strategy
 
-With 791 separate files in the local corpus, dumping the entire database into the LLM context is physically impossible under token and time limits. We selected **TF-IDF Classical Indexing** over a Vector Database for the following reasons:
+With hundreds of separate files in the local corpus, dumping the entire database into the LLM context is physically impossible under token and time limits. We selected **TF-IDF Classical Indexing** over a Vector Database for the following reasons:
 - **Zero-cold start & No external service overhead**: Unlike vector databases which require a local vector service (like FAISS, Qdrant) or heavy embedders (such as HuggingFace models), TF-IDF loads and fits locally in **<0.5 seconds**.
-- **Extreme Speed**: Transform and cosine similarity calculations take **<1ms** per ticket, allowing the overall system to complete all 91 tickets in under a minute.
+- **Extreme Speed**: Transform and cosine similarity calculations take **<1ms** per ticket. The latest validated end-to-end run completed all 89 visible tickets in 76.93 seconds including external LLM calls.
 - **Perfect Keyword Matching**: Support queries are vocabulary-heavy (e.g. "order ID", "chargeback", "DCC", "screen share"). TF-IDF naturally excels at exact keyword lookup, making it highly precise for technical documentation.
 
 ---
@@ -67,7 +68,7 @@ The separate pre-processing layer ensures **25% adversarial robustness score** p
 2. **PII Isolation**: By scrubbing PII from the conversation history, the LLM physically cannot echo credit cards or SSNs back to the user, fulfilling response safety rules.
 3. **RAG Spotlighting**: Retrieved documents are wrapped as untrusted evidence-only context, unsafe retrieved snippets are filtered, and the system prompt explicitly forbids following instructions embedded in user tickets or corpus documents.
 4. **Deterministic Multilingual Guardrails**: The runtime avoids heavyweight translation/classifier dependencies. Instead, it uses Unicode script checks, multilingual control-term dictionaries, mixed-script fail-closed logic, and homoglyph normalization.
-5. **Deterministic Submission Mode**: The official `main.py` path processes tickets sequentially in CSV order. Parallel execution remains an explicit debug override and is disabled by default.
+5. **Deterministic Control Plane**: Safety, routing, retrieval ordering, source ordering, confidence bands, and fallback rows are deterministic. The default batch executor uses 4 workers for runtime, while strict sequential mode is available for repeatability checks with `SUPPORT_AGENT_MAX_WORKERS=1`.
 
 ### Governance Policy Matrix
 
@@ -77,16 +78,16 @@ The implementation borrows the core Agent Governance Toolkit idea: safety is enf
 | --- | --- | --- |
 | `GOV-001` | Prompt injection, multilingual meta-control, exfiltration, or output manipulation | Skip LLM and escalate to security |
 | `GOV-002` | PII detected | Redact before model processing |
-| `GOV-003` | Destructive action without verified identity | Replace action with `verify_identity` |
-| `GOV-004` | Refund request over `$500` | Escalate to billing |
+| `GOV-003` | Destructive action without verified identity, including refund/subscription changes with missing details | Replace action with `verify_identity` and ask for required details |
+| `GOV-004` | Refund request over `$500` or unresolved billing dispute | Escalate to billing |
 | `GOV-005` | Unknown or malformed tool call | Convert to schema-valid human escalation |
 | `GOV-006` | Unsafe retrieved document | Filter from RAG context |
 | `GOV-007` | Unsafe model output | Override with deterministic escalation |
 | `GOV-008` | CSV formula payload | Neutralize dangerous leading characters |
 | `GOV-009` | Allowed tool call | Confirm least-privilege tool schema and prerequisites |
-| `GOV-010` | Legal, security, account-compromise, or harmless out-of-scope routing signal | Deterministically route without relying on the LLM |
+| `GOV-010` | Legal, security, account-compromise, harmless out-of-scope, or unsupported action routing signal | Deterministically route without relying on the LLM |
 | `GOV-011` | LLM/API unavailable but retrieval evidence is strong and low-risk | Return a conservative grounded reply with cited source docs |
-| `GOV-012` | Ambiguous request or weak/no retrieval evidence | Escalate with an explicit insufficient-evidence justification |
+| `GOV-012` | Weak/no retrieval evidence without legal, fraud, compromise, or unresolved billing risk | Reply with a supported-corpus clarification instead of escalating |
 
 This repository does not import Microsoft AGT directly because the challenge is a terminal batch evaluator with a strict 3-minute runtime. The local policy matrix gives the same practical benefit for this assignment: fail-closed enforcement, least-privilege tool handling, and audit evidence without extra runtime dependencies.
 
@@ -98,10 +99,11 @@ The agent relies on deterministic thresholds and semantic signals to escalate ti
 - **Financial Thresholds**: All refund requests over $500 are automatically escalated to a billing supervisor.
 - **Legal / Regulatory Threats**: Lawsuits, attorneys, subpoenas, regulators, or court language route to `escalate_to_human` with the legal department.
 - **Identity Theft / Fraud**: Suspected compromises trigger an immediate account lock and urgent escalation.
-- **Prerequisite Identity Verification**: If an action is requested but identity is unverified in context, the agent halts the action and calls `verify_identity`.
+- **Prerequisite Identity Verification**: If an account-level action is requested but identity is unverified in context, the agent halts the action and calls `verify_identity`. Missing refund/subscription details are requested in the same reply.
 - **Harmless Out-of-Scope**: Clearly harmless requests outside the support domain get a clarification reply instead of unnecessary escalation.
+- **Unsupported Operational Requests**: Requests such as file deletion code or removing employees from hiring accounts are replied to as out-of-scope instead of escalated.
 - **Strong FAQ Matches**: Safe, short FAQ-style tickets with strong retrieval matches receive deterministic corpus-grounded replies without model generation.
-- **Retrieval Failures**: If retrieved context scores are too low, the agent escalates with lower confidence and a `GOV-012` justification.
+- **Retrieval Failures**: If retrieved context scores are too low and no legal/security/fraud/unresolved-billing risk is present, the agent replies with a corpus-scope clarification and a `GOV-012` justification.
 - **LLM/API Failures**: If the model provider fails but retrieval is strong and low-risk, the agent replies conservatively from the cited document; otherwise it escalates.
 
 ---

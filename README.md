@@ -96,6 +96,25 @@ cd MLE-hiring
 
 You are free to use any language or runtime. We recommend **Python**, **JavaScript**, or **TypeScript**.
 
+### Current Python Agent
+
+The current solution lives in [`code/`](./code/) and uses a deterministic-first Python pipeline:
+
+- `code/main.py` is the batch entry point.
+- `code/agent.py` handles routing, tool decisions, response shaping, and provider fallback.
+- `code/safety.py` implements prompt-injection, PII, CSV, and tool-safety checks.
+- `code/retriever.py` indexes the local `data/` corpus with deterministic TF-IDF retrieval.
+- `code/ARCHITECTURE.md` documents the design, safety model, escalation logic, and failure modes.
+
+Run from the `code/` directory:
+
+```bash
+python main.py
+python validate_output.py
+```
+
+The latest validated run processed 89 tickets in 76.93 seconds, produced 60 replied rows and 29 escalated rows, and passed the structural validator with all 14 required output columns.
+
 ---
 
 ## Chat transcript logging

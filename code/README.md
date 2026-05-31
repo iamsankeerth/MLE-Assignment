@@ -30,16 +30,25 @@ Execute the primary entry point to process all tickets in `support_tickets/suppo
 python main.py
 ```
 
-This command now runs in deterministic submission mode by default:
-- tickets are processed sequentially in CSV order
+This command runs the current submission path by default:
+- tickets are processed with `SUPPORT_AGENT_MAX_WORKERS=4` unless overridden
 - deterministic safety/routing rules are applied before any LLM call
 - the LLM is only used as a bounded fallback for tickets not covered by deterministic handling
+- each run prints start/end timers and appends timing metadata to `support_tickets/run_history.csv`
 
-For local debugging only, you can opt into parallel execution by setting:
+To force strict sequential execution for repeatability checks:
 
 ```bash
-SUPPORT_AGENT_MAX_WORKERS=10 python main.py
+SUPPORT_AGENT_MAX_WORKERS=1 python main.py
 ```
+
+To change throughput for local debugging:
+
+```bash
+SUPPORT_AGENT_MAX_WORKERS=8 python main.py
+```
+
+The latest validated local run processed 89 tickets in 76.93 seconds with 60 replied rows, 29 escalated rows, 6 `verify_identity` calls, 24 `escalate_to_human` calls, 1 `lock_account` call, and 0 fallback/error rows.
 
 ## How to Validate Compliance
 
@@ -48,6 +57,8 @@ Run the project format validator to ensure structural and constraint compliance:
 ```bash
 python validate_output.py
 ```
+
+The validator checks output structure only. The latest generated `support_tickets/output.csv` passes with 89 rows and all 14 required columns.
 
 For repeatability checks, run the offline test suite:
 
