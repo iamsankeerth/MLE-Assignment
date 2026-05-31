@@ -113,3 +113,22 @@ The agent relies on deterministic thresholds and semantic signals to escalate ti
 - **Highly Novel Synonyms**: Standard TF-IDF struggles if a user uses highly conversational slang without overlap in technical terms (e.g., "my invigilator is stuck" instead of "Zoom compatible check failed").
 - **Language Identification**: The agent parses ISO codes based on LLM output; extremely brief text ("help") might defaulted to English (`en`).
 - **Conservative Bias**: Deterministic routing intentionally prefers safe escalation or templated grounded replies over richer but more variable model wording on borderline tickets.
+
+---
+
+## Self-Assessment
+
+The solution is strongest on safety, tool schema control, reproducible retrieval, source-path validity, and runtime. The visible run processes 89 tickets in 76.93 seconds, validates all 14 required columns, cites only existing corpus files, and uses deterministic policy gates before the LLM.
+
+Expected strengths on the hidden set:
+- Prompt-injection, data-exfiltration, output-manipulation, and multilingual/mixed-script attacks should usually fail closed before retrieval or generation.
+- Refund, subscription, account-compromise, legal, and out-of-scope routing is handled by deterministic code rather than free-form model judgment.
+- Source documents are normalized to existing `data/` paths, and malformed or unsafe tool calls are repaired before output.
+
+Expected risks on the hidden set:
+- Escalation F1 may be the most variable metric because hidden tickets can include subtle borderline billing/account scenarios.
+- TF-IDF retrieval can miss semantically relevant documents when ticket wording has little vocabulary overlap with the corpus.
+- Live LLM providers can introduce wording variance or rate-limit failures; deterministic fallback rows reduce the impact but do not remove provider dependency entirely.
+- PII detection covers common financial/contact identifiers, but unusual national IDs or highly obfuscated PII could require additional patterns.
+
+If given more time, the next improvements would be a larger hidden-style regression set, more deterministic FAQ templates for high-frequency corpus topics, and a repeat-run diff harness that compares full `output.csv` files under the exact submission environment.
