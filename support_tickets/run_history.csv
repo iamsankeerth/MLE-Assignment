@@ -1,2 +1,5 @@
 started_at,finished_at,elapsed_seconds,elapsed_hms,num_tickets,max_workers,output_path
 2026-05-28T17:22:00.429068+05:30,2026-05-28T17:22:58.674525+05:30,58.24,00:00:58,89,8,C:\Users\lenovo\Desktop\San\Fun_Projects\MLE - Assignment\code\..\support_tickets\output.csv
+2026-05-31T09:51:57.532429+05:30,2026-05-31T09:59:23.600311+05:30,446.07,00:07:26,89,1,C:\Users\lenovo\Desktop\San\Fun_Projects\MLE - Assignment\code\..\support_tickets\output.csv
+2026-05-31T15:47:26.752196+05:30,2026-05-31T15:52:17.489231+05:30,290.74,00:04:51,89,4,C:\Users\lenovo\Desktop\San\Fun_Projects\MLE - Assignment\code\..\support_tickets\output.csv
+2026-05-31T15:58:23.220807+05:30,2026-05-31T15:59:17.776681+05:30,54.56,00:00:55,89,4,C:\Users\lenovo\Desktop\San\Fun_Projects\MLE - Assignment\code\..\support_tickets\output.csv

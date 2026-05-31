@@ -32,6 +32,8 @@ MANUAL_ACTION_TERMS = (
     "review my answers", "make visa refund me", "tell the company", "change my name",
 )
 DETERMINISTIC_REPLY_SCORE_THRESHOLD = 0.12
+SECONDARY_REPLY_SCORE_THRESHOLD = 0.02
+LLM_CONTEXT_DOC_CHAR_LIMIT = 2000
 
 # Load environment variables if dot-env is available
 try:
@@ -172,13 +174,14 @@ class SupportAgentOrchestrator:
         confidence_score: float = 1.0,
         actions_taken: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        formatted_justification = self._format_justification_for_output(justification, escalated=True)
         if actions_taken is None:
             actions_taken = [{
                 "action": "escalate_to_human",
                 "parameters": {
                     "priority": priority,
                     "department": department,
-                    "summary": justification,
+                    "summary": formatted_justification,
                 }
             }]
         normalized_source_documents = self._normalize_source_documents_value(source_documents)
@@ -189,7 +192,7 @@ class SupportAgentOrchestrator:
             "status": "escalated",
             "product_area": product_area,
             "response": response,
-            "justification": justification,
+            "justification": formatted_justification,
             "request_type": request_type,
             "confidence_score": confidence_score,
             "source_documents": normalized_source_documents,
@@ -357,6 +360,50 @@ class SupportAgentOrchestrator:
         allowed = {"product_issue", "feature_request", "bug", "invalid"}
         return request_type if request_type in allowed else "product_issue"
 
+    def _ensure_response_traceability(self, response: str, source_documents: str, final_status: str) -> str:
+        if final_status != "replied" or not source_documents:
+            return response
+        cited_paths = [path for path in str(source_documents).split("|") if path]
+        if any(path in response for path in cited_paths):
+            return response
+        visible_paths = ", ".join(cited_paths[:2])
+        return f"{response} See: {visible_paths}."
+
+    def _extract_policy_detail(self, justification: str) -> str:
+        if not justification:
+            return ""
+        match = re.search(r"detail=(.+?)(?:\s*\[Safety:|\s*\[|$)", str(justification))
+        return match.group(1).strip().rstrip(".") if match else ""
+
+    def _format_justification_for_output(self, justification: str, escalated: bool = False) -> str:
+        if not justification:
+            return justification
+
+        detail = self._extract_policy_detail(justification)
+        if not detail:
+            return justification
+
+        prefix = "Escalated because " if escalated else "Reason: "
+        normalized_justification = str(justification).strip()
+        if normalized_justification.startswith(prefix):
+            return normalized_justification
+        return f"{prefix}{detail}. [{normalized_justification}]"
+
+    def _compose_final_justification(
+        self,
+        parsed_justification: str,
+        safety_justification: str,
+        final_status: str,
+    ) -> str:
+        if final_status == "escalated":
+            preferred_reason = self._extract_policy_detail(safety_justification) or parsed_justification.strip()
+            if preferred_reason:
+                return (
+                    f"Escalated because {preferred_reason.rstrip('.')}."
+                    f" [Model: {parsed_justification}] [Safety: {safety_justification}]"
+                )
+        return f"{parsed_justification} [Safety: {safety_justification}]"
+
     def _llm_confidence_band(self, final_status: str, risk_level: str, source_documents: str) -> float:
         has_sources = bool(source_documents)
         if final_status == "escalated":
@@ -438,6 +485,37 @@ class SupportAgentOrchestrator:
         summary = " ".join(sentences[:2]).strip() or text
         return summary[:320].rstrip()
 
+    def _looks_like_compound_request(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if lowered.count("?") >= 2:
+            return True
+        compound_markers = (
+            " also ",
+            " and ",
+            " plus ",
+            " as well as ",
+            " another question",
+            " two questions",
+            " first,",
+            " secondly",
+        )
+        marker_hits = sum(1 for marker in compound_markers if marker in lowered)
+        if marker_hits >= 2:
+            return True
+        return lowered.count("?") >= 1 and marker_hits >= 1
+
+    def _select_supporting_docs(self, retrieved_docs: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+        if not retrieved_docs:
+            return []
+        selected = [retrieved_docs[0]]
+        if (
+            len(retrieved_docs) > 1
+            and self._looks_like_compound_request(text)
+            and float(retrieved_docs[1].get("score", 0.0)) > 0.0
+        ):
+            selected.append(retrieved_docs[1])
+        return selected
+
     def _infer_product_area(self, company: str, doc_path: str, text: str) -> str:
         path = doc_path.lower()
         text = text.lower()
@@ -452,9 +530,29 @@ class SupportAgentOrchestrator:
         company_name = str(company or "").strip().lower()
         return company_name if company_name and company_name != "nan" else "general"
 
-    def _build_deterministic_reply_response(self, top_doc: Dict[str, Any]) -> str:
-        summary = self._summarize_document(top_doc.get("content", ""))
-        return f"Based on {top_doc['path']}, {summary}"
+    def _build_grounded_reply_response(self, docs: List[Dict[str, Any]]) -> str:
+        if not docs:
+            return "I could not find grounded support guidance in the provided documentation."
+
+        primary = docs[0]
+        primary_summary = self._summarize_document(primary.get("content", ""))
+        response = f"Based on {primary['path']}, {primary_summary}"
+
+        if len(docs) > 1:
+            secondary = docs[1]
+            secondary_summary = self._summarize_document(secondary.get("content", ""))
+            response += f" Also, {secondary['path']} explains: {secondary_summary}"
+
+        return response
+
+    def _truncate_doc_for_llm_context(self, content: str) -> str:
+        text = str(content or "")
+        if len(text) <= LLM_CONTEXT_DOC_CHAR_LIMIT:
+            return text
+        return (
+            text[:LLM_CONTEXT_DOC_CHAR_LIMIT].rstrip()
+            + "\n[TRUNCATED: document content shortened before LLM context injection]"
+        )
 
     def _deterministic_routing_row(
         self,
@@ -537,19 +635,20 @@ class SupportAgentOrchestrator:
             )
 
         if self._is_deterministic_reply_candidate(text, retrieved_docs):
-            top_doc = retrieved_docs[0]
-            justification = policy_evidence("GOV-010", "replied", f"Strong corpus match allowed deterministic reply using {top_doc['path']}.")
+            supporting_docs = self._select_supporting_docs(retrieved_docs, text)
+            cited_paths = ", ".join(doc["path"] for doc in supporting_docs)
+            justification = policy_evidence("GOV-010", "replied", f"Strong corpus match allowed deterministic reply using {cited_paths}.")
             return self._reply_row(
                 issue_json,
                 subject,
                 company,
-                self._build_deterministic_reply_response(top_doc),
+                self._build_grounded_reply_response(supporting_docs),
                 justification,
                 "product_issue",
                 "low",
                 pii_detected,
                 source_documents,
-                product_area=self._infer_product_area(company, top_doc["path"], text),
+                product_area=self._infer_product_area(company, supporting_docs[0]["path"], text),
                 confidence_score=0.82,
             )
 
@@ -582,17 +681,15 @@ class SupportAgentOrchestrator:
             return deterministic
 
         if self._retrieval_is_strong(retrieved_docs):
-            top_doc = retrieved_docs[0]
-            justification = policy_evidence("GOV-011", "replied", f"LLM unavailable; deterministic grounded fallback used with {top_doc['path']}.")
-            response = (
-                "I found relevant support documentation for your request. "
-                f"Please refer to {top_doc['path']} for the most relevant guidance. "
-                "If this does not resolve the issue, a support agent can review the case."
-            )
+            supporting_docs = self._select_supporting_docs(retrieved_docs, self._ticket_text(conversation, subject))
+            cited_paths = ", ".join(doc["path"] for doc in supporting_docs)
+            justification = policy_evidence("GOV-011", "replied", f"LLM unavailable; deterministic grounded fallback used with {cited_paths}.")
+            response = self._build_grounded_reply_response(supporting_docs)
             return self._reply_row(
                 issue_json, subject, company, response, justification,
                 "product_issue", "low", pii_detected, source_documents,
-                product_area="general", confidence_score=0.6
+                product_area=self._infer_product_area(company, supporting_docs[0]["path"], self._ticket_text(conversation, subject)),
+                confidence_score=0.6
             )
 
         justification = policy_evidence("GOV-012", "escalated", "LLM unavailable and corpus evidence was insufficient; ambiguous risk escalated.")
@@ -712,7 +809,7 @@ class SupportAgentOrchestrator:
             docs_context += (
                 f"<document index=\"{idx+1}\" path=\"{doc['path']}\">\n"
                 "<document_text>\n"
-                f"{doc['content']}\n"
+                f"{self._truncate_doc_for_llm_context(doc.get('content', ''))}\n"
                 "</document_text>\n"
                 "</document>\n"
             )
@@ -743,6 +840,7 @@ Your objective is to classify and safely answer the user support ticket using ON
    - issue_refund is only valid for transactions <= 90 days and <= $500. Otherwise, you MUST call 'escalate_to_human'.
 7. CALIBRATED CONFIDENCE: Calibrate your confidence score (0.0 to 1.0) honestly. If you have to guess, or if information is sparse, lower the score.
 8. OUTPUT STRUCTURE: Return a JSON object matching the requested schema strictly. Do not include markdown codeblocks around it; return the raw structured schema format.
+9. COMPLETENESS: If the ticket asks multiple questions or includes multiple support issues, answer each grounded part explicitly. Do not ignore one part of a compound request.
 """
 
             llm_messages = [{"role": "system", "content": system_prompt}]
@@ -810,8 +908,12 @@ Your objective is to classify and safely answer the user support ticket using ON
                 "company": company,
                 "status": final_status,
                 "product_area": parsed_data.product_area,
-                "response": parsed_data.response,
-                "justification": f"{parsed_data.justification} [Safety: {safety_justification}]",
+                "response": self._ensure_response_traceability(parsed_data.response, source_documents_col, final_status),
+                "justification": self._compose_final_justification(
+                    parsed_data.justification,
+                    safety_justification,
+                    final_status,
+                ),
                 "request_type": normalized_request_type,
                 "confidence_score": normalized_confidence,
                 "source_documents": source_documents_col,

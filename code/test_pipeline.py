@@ -95,6 +95,30 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertIn("GOV-010", res["justification"])
         self.assertTrue(res["response"].startswith("Based on data/devplatform/assessments/expiration.md"))
 
+    def test_compound_deterministic_reply_uses_multiple_docs(self):
+        mock_docs = [
+            {
+                "path": "data/devplatform/assessments/expiration.md",
+                "content": "Assessments expire after 30 days unless set to active."
+            },
+            {
+                "path": "data/devplatform/errors/api-500.md",
+                "content": "API 500 errors can happen during assessments and usually require retrying after a short delay."
+            },
+        ]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FailingLLMEngine()
+        )
+
+        ticket_json = '[{"role": "user", "content": "How long do assessments stay active, and what should I do about API 500 errors?"}]'
+        res = orchestrator.process_ticket(ticket_json, "Assessment expiry and API errors", "DevPlatform")
+
+        self.assertEqual(res["status"], "replied")
+        self.assertIn("data/devplatform/assessments/expiration.md", res["response"])
+        self.assertIn("data/devplatform/errors/api-500.md", res["response"])
+
     def test_offline_orchestrator_action_gate_enforcement(self):
         # Propose refund and check unverified identity gate
         mock_docs = [{"path": "data/general.md", "content": "Refunds are processed."}]
@@ -233,8 +257,10 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertEqual(res["status"], "escalated")
         self.assertEqual(actions[0]["action"], "escalate_to_human")
         self.assertEqual(actions[0]["parameters"]["department"], "legal")
+        self.assertIn("escalated because legal/regulatory threat requires human review.", res["justification"].lower())
         self.assertIn("GOV-010", res["justification"])
         self.assertIn("Legal/regulatory threat", res["justification"])
+        self.assertIn("escalated because legal/regulatory threat requires human review.", actions[0]["parameters"]["summary"].lower())
 
     def test_account_takeover_locks_account_and_escalates(self):
         mock_docs = [{"path": "data/devplatform/security.md", "content": "Security support handles account compromise."}]
@@ -304,6 +330,7 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertEqual(res["confidence_score"], 0.6)
         self.assertIn("GOV-011", res["justification"])
         self.assertNotIn("simulated provider outage", res["justification"])
+        self.assertIn("Based on data/devplatform/assessments/expiration.md", res["response"])
 
     def test_llm_failure_with_weak_docs_escalates_ambiguous_risk(self):
         retriever = SupportRetriever(provider=InMemoryDocumentProvider([]))
@@ -319,6 +346,32 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertEqual(res["status"], "escalated")
         self.assertEqual(actions[0]["action"], "escalate_to_human")
         self.assertIn("GOV-012", res["justification"])
+
+    def test_llm_escalation_uses_plain_reason_with_safety_context(self):
+        mock_docs = [{"path": "data/devplatform/memo.md", "content": "Operations memo reference for platform teams."}]
+        retriever = SupportRetriever(provider=InMemoryDocumentProvider(mock_docs))
+        orchestrator = SupportAgentOrchestrator(
+            retriever=retriever,
+            llm_engine=FakeLLMEngine(json.dumps({
+                "status": "escalated",
+                "product_area": "general",
+                "response": "A human agent needs to review this.",
+                "justification": "The request is not covered by the retrieved documentation.",
+                "request_type": "product_issue",
+                "confidence_score": 0.8,
+                "risk_level": "medium",
+                "language": "en",
+                "actions_taken": []
+            }))
+        )
+
+        ticket_json = '[{"role": "user", "content": "Operations memo reference for platform teams."}]'
+        res = orchestrator.process_ticket(ticket_json, "Internal memo reference", "DevPlatform")
+
+        self.assertEqual(res["status"], "escalated")
+        self.assertIn("Escalated because", res["justification"])
+        self.assertIn("[Model:", res["justification"])
+        self.assertIn("[Safety:", res["justification"])
 
     def test_nan_subject_does_not_crash_batch_processing(self):
         mock_docs = [{"path": "data/devplatform/general.md", "content": "Support can help reschedule assessments."}]
@@ -368,6 +421,7 @@ class TestDeepenedPipeline(unittest.TestCase):
         self.assertEqual(res["status"], "replied")
         self.assertEqual(res["confidence_score"], 0.74)
         self.assertEqual(res["language"], "en")
+        self.assertIn("data/devplatform/general.md", res["response"])
 
     def test_repeatability_same_input_same_output(self):
         mock_docs = [{"path": "data/devplatform/general.md", "content": "General platform support guidance."}]
@@ -422,6 +476,17 @@ class TestDeepenedPipeline(unittest.TestCase):
             res["source_documents"],
             "data/devplatform/a-first.md|data/devplatform/z-last.md"
         )
+
+    def test_llm_context_document_content_is_truncated(self):
+        orchestrator = SupportAgentOrchestrator(
+            retriever=SupportRetriever(provider=InMemoryDocumentProvider([])),
+            llm_engine=FailingLLMEngine()
+        )
+
+        truncated = orchestrator._truncate_doc_for_llm_context("x" * 2500)
+
+        self.assertLess(len(truncated), 2100)
+        self.assertIn("[TRUNCATED:", truncated)
 
     def test_legitimate_queries_bypass_identity_verification(self):
         mock_docs = [

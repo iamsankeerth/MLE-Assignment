@@ -75,7 +75,7 @@ def _failure_row(row, justification: str):
         "actions_taken": "[]"
     }
 
-def process_ticket_rows(df_input, orchestrator, max_workers: int = 1, progress_every: int = 10):
+def process_ticket_rows(df_input, orchestrator, max_workers: int = 4, progress_every: int = 10):
     num_tickets = len(df_input)
     results = [None] * num_tickets
     completed_count = 0
@@ -153,7 +153,7 @@ def main():
         print(f"[ERROR] Failed to initialize orchestrator: {str(e)}")
         return
 
-    max_workers = int(os.environ.get("SUPPORT_AGENT_MAX_WORKERS", "1"))
+    max_workers = int(os.environ.get("SUPPORT_AGENT_MAX_WORKERS", "4"))
     results = process_ticket_rows(df_input, orchestrator, max_workers=max_workers)
 
     # Ensure all slots are filled to prevent index errors
